@@ -1,10 +1,20 @@
 import time
+import signal
 import cv2
 from vision import VisionAgent
 from control import ControlAgent
 from hardware import RobotHardware
 
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
 def main():
+    # SIGTERM (e.g. `kill`, `systemctl stop`) doesn't run Python's finally
+    # blocks by default — only SIGINT does, via KeyboardInterrupt. Route both
+    # through the same exception so hw.stop() always runs on shutdown.
+    signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+
     print("Initializing Robot Modules...")
 
     hw = RobotHardware()

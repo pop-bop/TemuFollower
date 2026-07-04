@@ -47,6 +47,13 @@ class VisionAgent:
             print("[Vision] No camera found. Running in simulation mode.")
             self.simulation_mode = True
 
+        # Wide/far search ROI: checked when the close-in ROI loses the line,
+        # so a curve or gap doesn't immediately look like a dead end.
+        self.WIDE_ROI_Y_START_RATIO = 0.15
+        self.WIDE_ROI_X_START_RATIO = 0.0
+        self.WIDE_ROI_X_END_RATIO = 1.0
+        self.MIN_LINE_AREA = 40
+
     def get_frame(self):
         if self.simulation_mode:
             print("[Vision] Simulation mode — generating test frames. Press 'q' in OpenCV window to exit.")
@@ -166,17 +173,67 @@ class VisionAgent:
 
         return mask_combined, mask_closed, mask_global, mask_adaptive, mask_color
 
+    def _locate_line_simple(self, gray_roi):
+        """
+        Simple largest-contour line finder used for the wide/far search ROI.
+        Returns (cx, cy) in gray_roi-local coordinates, or None if nothing found.
+        """
+        mask_black, _, _, _, _ = self._improve_line_mask(gray_roi)
+        contours, _ = cv2.findContours(mask_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        largest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest) < self.MIN_LINE_AREA:
+            return None
+
+        M = cv2.moments(largest)
+        if M["m00"] == 0:
+            return None
+
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        return cx, cy
+
+    def _try_wide_roi_fallback(self, frame, result):
+        """
+        When the close-in ROI loses the line, search a wider/farther-out ROI
+        before concluding the line has actually ended. On success, marks
+        special_state="approach" so the control layer can steer gently back
+        toward the line instead of treating it as a dead end.
+        """
+        h, w = frame.shape[:2]
+        wy_start = int(h * self.WIDE_ROI_Y_START_RATIO)
+        wx_start = int(w * self.WIDE_ROI_X_START_RATIO)
+        wx_end = int(w * self.WIDE_ROI_X_END_RATIO)
+
+        wide_roi = frame[wy_start:, wx_start:wx_end]
+        if wide_roi.size == 0:
+            return False
+
+        gray_wide = cv2.cvtColor(wide_roi, cv2.COLOR_BGR2GRAY)
+        found = self._locate_line_simple(gray_wide)
+        if found is None:
+            return False
+
+        cx, cy = found
+        real_x = cx + wx_start
+        real_y = cy + wy_start
+        result["line_center_x"] = real_x
+        result["line_center_y"] = real_y
+        result["special_state"] = "approach"
+        cv2.circle(frame, (real_x, real_y), 6, (255, 0, 255), -1)
+        cv2.putText(frame, "APPROACH", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+        return True
+
     def process_frame(self, frame):
         """
         Processes a single frame for line following and maze solving.
-        Returns a dict containing line position, red line tracking, and special states.
+        Returns a dict containing line position and special states.
         """
         result = {
             "line_center_x": None,
             "line_center_y": None,
-            "red_line_detected": False,
-            "red_line_center_x": None,
-            "red_line_center_y": None,
             "line_ended": False,
             "is_dashed": False,
             "special_state": None,
@@ -196,45 +253,11 @@ class VisionAgent:
         cv2.rectangle(frame, (roi_start_x, roi_start_y), (roi_end_x, h), (0, 255, 255), 2)
         cv2.putText(frame, "ROI", (roi_start_x, roi_start_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-        # --- RED LINE DETECTION ---
-        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask_red_1 = cv2.inRange(hsv_roi, np.array([0, 120, 70]), np.array([10, 255, 255]))
-        mask_red_2 = cv2.inRange(hsv_roi, np.array([170, 120, 70]), np.array([180, 255, 255]))
-        mask_red = cv2.bitwise_or(mask_red_1, mask_red_2)
-
-        contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours_red:
-            largest_red = max(contours_red, key=cv2.contourArea)
-            if cv2.contourArea(largest_red) > 300:
-                x, y, w_box, h_box = cv2.boundingRect(largest_red)
-                real_y = y + roi_start_y
-                real_x = x + roi_start_x
-                aspect_ratio = float(w_box) / max(1, h_box)
-
-                result["red_line_detected"] = True
-                result["red_line_center_x"] = real_x + w_box // 2
-                result["red_line_center_y"] = real_y + h_box // 2
-
-                if aspect_ratio > 2.0:
-                    cv2.rectangle(frame, (real_x, real_y), (real_x + w_box, real_y + h_box), (0, 0, 255), -1)
-                    cv2.putText(frame, "RED LINE (TRACK)", (real_x, real_y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    if real_y > frame.shape[0] * 0.75:
-                        result["special_state"] = "red_line_beneath"
-                else:
-                    cv2.rectangle(frame, (real_x, real_y), (real_x + w_box, real_y + h_box), (0, 0, 255), 2)
-                    cv2.putText(frame, "RED TARGET", (real_x, real_y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
         # --- IMPROVED BLACK LINE DETECTION ---
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        # Paint out red so it doesn't interfere with line detection
-        gray_roi_for_line = gray_roi.copy()
-        gray_roi_for_line[mask_red > 0] = 255
-
         mask_black, mask_closed, mask_global, mask_adaptive, mask_color = \
-            self._improve_line_mask(gray_roi_for_line)
+            self._improve_line_mask(gray_roi)
 
         b, g, r = cv2.split(roi)
         color_threshold = 50
@@ -324,6 +347,8 @@ class VisionAgent:
                     if w_line > roi_w * 0.8:
                         result["special_state"] = "intersection"
                         cv2.putText(frame, "INTERSECTION", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            elif self._try_wide_roi_fallback(frame, result):
+                pass
             else:
                 result["line_center_x"] = None
                 result["line_center_y"] = None
@@ -384,6 +409,8 @@ class VisionAgent:
                         result["line_ended"] = True
                         result["special_state"] = "dead_end"
                         cv2.putText(frame, "DEAD END (180)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        elif self._try_wide_roi_fallback(frame, result):
+            pass
         else:
             result["line_ended"] = True
             result["special_state"] = "dead_end"

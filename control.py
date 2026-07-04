@@ -51,7 +51,7 @@ class ControlAgent:
 
         # State machine
         self.state = "FOLLOWING"
-        # FOLLOWING | RED_TRACKING | TURNING | SPINNING | BACKTRACKING | RECOVERING | STOPPED
+        # FOLLOWING | APPROACH | TURNING | SPINNING | BACKTRACKING | RECOVERING | STOPPED | AUTOTUNE
 
         self.last_known_error = 0
         self.turn_start_time = 0
@@ -63,9 +63,6 @@ class ControlAgent:
 
         self.backtrack_target = None  # next node to move toward while backtracking
 
-        # ---- RED LINE TRACKING ----
-        self.saw_red = False
-
         # ---- DASHED LINE HANDLING ----
         self.dashed_countdown = 0  # frames to keep driving straight during a dashed gap
 
@@ -75,9 +72,27 @@ class ControlAgent:
         self.MIN_MOTOR_SPEED = 0.15
         self.MAX_MOTOR_SPEED = 1.0
 
+        # ---- RECOVERY (spin search for a lost line) ----
+        # Give up spinning after this long without finding the line again
+        # (instead of spinning forever), but keep re-checking every frame.
+        self.LINE_LOST_STOP_TIMEOUT_S = 4.0
+        self.recovery_start_time = None
+
+        # ---- APPROACH (wide-ROI reacquire, far/curved line) ----
+        self.APPROACH_SPEED = 0.4 * self.base_speed
+
+        # ---- SPEED RAMPING (slew-rate limited forward speed) ----
+        self.SLEW_RATE_PER_S = 0.3
+        self.applied_forward = 0.0
+        self._dt = 0.0
+
+        # ---- STEERING: deadzone + blended sharp-turn response ----
+        self.CENTER_DEADZONE = 0.12
+        self.SHARP_TURN_SPEED = 0.6
+        self.TURN_LIMIT = 0.8
+        self.MAX_ERROR_PX = float(self.target_x)
+
         # ---- SELF-TUNING PID (relay / Ziegler-Nichols auto-tune) ----
-        # Add "AUTOTUNE" to the state machine: FOLLOWING | RED_TRACKING | TURNING |
-        # SPINNING | BACKTRACKING | RECOVERING | STOPPED | AUTOTUNE
         self.RELAY_AMPLITUDE = 0.35        # turn magnitude used to force oscillation
         self.AUTOTUNE_BASE_SPEED = 0.5 * self.base_speed
         self.AUTOTUNE_CYCLES = 4           # full oscillation cycles to average over
@@ -118,14 +133,31 @@ class ControlAgent:
         else:
             return "forward"
 
+    def _direction_leads_to_visited(self, node, direction):
+        """Whether taking `direction` from `node` (given current heading) walks
+        straight back onto a node we've already visited."""
+        actual = (self.heading + {"forward": 0, "right": 1, "backward": 2, "left": 3}[direction]) % 4
+        dx = [0, 1, 0, -1][actual]
+        dy = [1, 0, -1, 0][actual]
+        neighbor = self.nodes.get((node.x + dx, node.y + dy))
+        return neighbor is not None and neighbor.visited
+
     def _pick_unexplored_direction(self, node):
-        """Return a direction string not yet explored from this node, or None."""
+        """Return a direction string not yet explored from this node, or None.
+
+        Prefers a direction that leads into unvisited territory — the robot
+        shouldn't want to re-tread ground it's already covered. Only falls
+        back to a direction that leads to a visited node if every unexplored
+        option does (e.g. a loop back to an earlier intersection).
+        """
         candidates = ["left", "right", "forward"]
         random.shuffle(candidates)
-        for d in candidates:
-            if d not in node.explored_dirs:
-                return d
-        return None
+        unexplored = [d for d in candidates if d not in node.explored_dirs]
+        if not unexplored:
+            return None
+
+        fresh = [d for d in unexplored if not self._direction_leads_to_visited(node, d)]
+        return fresh[0] if fresh else unexplored[0]
 
     # ------------------------------------------------------------------
     # main entry
@@ -155,6 +187,7 @@ class ControlAgent:
         self.last_time = current_time
         if dt <= 0:
             dt = 0.001
+        self._dt = dt
 
         # ---- state dispatch ----
         if self.state == "STOPPED":
@@ -173,13 +206,11 @@ class ControlAgent:
             return self._handle_backtrack(vision_data, current_time)
 
         if self.state == "RECOVERING":
-            return self._handle_recovery()
+            return self._handle_recovery(vision_data, current_time)
 
-        # ---- FOLLOWING / RED_TRACKING ----
+        # ---- FOLLOWING ----
         cx = vision_data.get("line_center_x")
         cy = vision_data.get("line_center_y")
-        red_detected = vision_data.get("red_line_detected", False)
-        red_cx = vision_data.get("red_line_center_x")
         line_ended = vision_data.get("line_ended", False)
         is_dashed = vision_data.get("is_dashed", False)
         special = vision_data.get("special_state")
@@ -191,17 +222,15 @@ class ControlAgent:
         if self.dashed_countdown > 0:
             self.dashed_countdown -= 1
             # Continue straight regardless of line data
-            if red_detected and red_cx is not None:
-                self.state = "RED_TRACKING"
-                return self._red_track_speeds(vision_data)
             if cx is not None:
                 return self._pid_follow(cx)
-            return self.base_speed, self.base_speed  # straight
+            forward = self._slew_forward(self.base_speed)
+            return forward, forward  # straight
 
-        # --- Red line tracking ---
-        if red_detected and red_cx is not None:
-            self.state = "RED_TRACKING"
-            return self._red_track_speeds(vision_data)
+        # --- Wide-ROI reacquire: line is far/curved but still visible ---
+        if special == "approach" and cx is not None:
+            self.state = "APPROACH"
+            return self._approach_speeds(cx)
 
         # --- Line ended (dead end) ---
         if line_ended and special == "dead_end":
@@ -240,8 +269,8 @@ class ControlAgent:
             return self._pid_follow(cx)
 
         # No line and not a dead end — recovery spin
-        self.state = "RECOVERING"
-        return self._handle_recovery()
+        self._enter_recovery(current_time)
+        return self._handle_recovery(vision_data, current_time)
 
     # ------------------------------------------------------------------
     # PID line following
@@ -249,55 +278,77 @@ class ControlAgent:
     def _pid_follow(self, cx):
         error = cx - self.target_x
         self.last_known_error = error
+        norm_error = error / self.MAX_ERROR_PX if self.MAX_ERROR_PX else 0.0
 
         sign = 1 if error > 0 else -1
         p_error = sign * (abs(error) ** self.nl_factor)
 
-        dt = max(time.time() - self.last_time, 0.001)
+        dt = self._dt
         self.integral += error * dt
         self.integral = max(-1000, min(1000, self.integral))
         derivative = (error - self.last_error) / dt
         self.last_error = error
 
-        turn = (self.Kp * p_error) + (self.Ki * self.integral) + (self.Kd * derivative)
+        pid_turn = (self.Kp * p_error) + (self.Ki * self.integral) + (self.Kd * derivative)
 
-        left = self.base_speed
-        right = self.base_speed
+        if abs(norm_error) <= self.CENTER_DEADZONE:
+            turn = pid_turn
+        else:
+            # Beyond the deadzone, blend the PID turn toward a fixed sharp-turn
+            # response so large errors react decisively instead of waiting on
+            # the (comparatively slow) integral/derivative terms to catch up.
+            excess = (abs(norm_error) - self.CENTER_DEADZONE) / (1.0 - self.CENTER_DEADZONE)
+            excess = max(0.0, min(1.0, excess))
+            sharp_turn = sign * self.SHARP_TURN_SPEED
+            turn = (1.0 - excess) * pid_turn + excess * sharp_turn
+
+        turn = max(-self.TURN_LIMIT, min(self.TURN_LIMIT, turn))
+
+        forward = self._slew_forward(self.base_speed)
+        left = forward
+        right = forward
         if turn > 0:
             right -= turn
         else:
             left += turn
 
-        if abs(error) > 50:
-            left *= 0.8
-            right *= 0.8
-
         return left, right
 
     # ------------------------------------------------------------------
-    # Red line tracking
+    # Approach (wide-ROI reacquire — line far away or around a curve)
     # ------------------------------------------------------------------
-    def _red_track_speeds(self, vision_data):
-        """Steer toward the red line using proportional control."""
-        red_cx = vision_data.get("red_line_center_x")
-        if red_cx is None:
-            self.state = "FOLLOWING"
-            return self.base_speed, self.base_speed
+    def _approach_speeds(self, cx):
+        """Gentle proportional steering at reduced speed while closing back
+        in on a line that was only found via the wide/far search ROI."""
+        error = cx - self.target_x
+        self.last_known_error = error
 
-        error = red_cx - self.target_x
-        Kp_red = 0.005
-        turn = Kp_red * error
+        Kp_approach = 0.006
+        turn = Kp_approach * error
+        turn = max(-self.TURN_LIMIT, min(self.TURN_LIMIT, turn))
 
-        left = self.base_speed * 0.9
-        right = self.base_speed * 0.9
+        forward = self._slew_forward(self.APPROACH_SPEED)
+        left = forward
+        right = forward
         if turn > 0:
             right -= turn
         else:
             left += turn
 
-        left = max(0.0, min(1.0, left))
-        right = max(0.0, min(1.0, right))
         return left, right
+
+    # ------------------------------------------------------------------
+    # Speed ramping
+    # ------------------------------------------------------------------
+    def _slew_forward(self, target_forward):
+        """Limit how fast the forward speed component can change per second,
+        so the robot ramps smoothly instead of snapping to full speed."""
+        max_delta = self.SLEW_RATE_PER_S * self._dt
+        if target_forward > self.applied_forward:
+            self.applied_forward = min(target_forward, self.applied_forward + max_delta)
+        else:
+            self.applied_forward = max(target_forward, self.applied_forward - max_delta)
+        return self.applied_forward
 
     # ------------------------------------------------------------------
     # Turn handling (intersection turns)
@@ -417,7 +468,33 @@ class ControlAgent:
     # ------------------------------------------------------------------
     # Recovery (lost line, spinning to find it)
     # ------------------------------------------------------------------
-    def _handle_recovery(self):
+    def _enter_recovery(self, current_time):
+        if self.state != "RECOVERING":
+            self.recovery_start_time = current_time
+        self.state = "RECOVERING"
+
+    def _recovered_to_following(self):
+        """Line reacquired after being genuinely lost. Rather than blindly
+        continuing wherever the spin happened to point, head back to the
+        nearest intersection with unexplored options — the robot shouldn't
+        assume whatever's ahead is new ground just because it found a line."""
+        print("[Maze] Line reacquired after recovery — returning to nearest open intersection.")
+        self.applied_forward = 0.0
+        self.state = "BACKTRACKING"
+        self._setup_backtrack()
+
+    def _handle_recovery(self, vision_data, current_time):
+        cx = vision_data.get("line_center_x")
+        if cx is not None:
+            self._recovered_to_following()
+            return self.base_speed, self.base_speed
+
+        if (self.recovery_start_time is not None
+                and (current_time - self.recovery_start_time) > self.LINE_LOST_STOP_TIMEOUT_S):
+            # Give up spinning in place, but keep watching for the line —
+            # _calculate_speeds_raw re-enters this every frame regardless.
+            return 0.0, 0.0
+
         if self.last_known_error > 0:
             return 0.6, 0.0
         else:
@@ -442,8 +519,8 @@ class ControlAgent:
         cx = vision_data.get("line_center_x")
         if cx is None:
             print("[Autotune] Lost the line during auto-tune, aborting. Keeping previous gains.")
-            self.state = "RECOVERING"
-            return self._handle_recovery()
+            self._enter_recovery(current_time)
+            return self._handle_recovery(vision_data, current_time)
 
         error = cx - self.target_x
         # Same nonlinear transform _pid_follow applies before multiplying by
