@@ -47,10 +47,6 @@ class VisionAgent:
             print("[Vision] No camera found. Running in simulation mode.")
             self.simulation_mode = True
 
-        # HOG pedestrian detector (built into OpenCV, no extra files needed)
-        self.hog = cv2.HOGDescriptor()
-        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-
     def get_frame(self):
         if self.simulation_mode:
             print("[Vision] Simulation mode — generating test frames. Press 'q' in OpenCV window to exit.")
@@ -137,55 +133,9 @@ class VisionAgent:
         self.camera = None
         self.camera_kind = None
 
-    def _detect_humans(self, roi):
-        """HOG pedestrian detection on the ROI.
-        Returns a binary mask (same size as ROI) where white = human region.
+    def _improve_line_mask(self, gray_roi):
         """
-        mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-        if roi.size == 0:
-            return mask
-
-        # HOG needs a reasonably sized image; resize ROI up for better detection
-        rh, rw = roi.shape[:2]
-        scale = max(1.0, 64.0 / rh)  # ensure minimum height for HOG
-        if scale > 1.0:
-            roi_scaled = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-        else:
-            roi_scaled = roi
-
-        # Multi-scale detection with different winStride and padding
-        boxes, weights = self.hog.detectMultiScale(
-            roi_scaled,
-            winStride=(4, 4),
-            padding=(8, 8),
-            scale=1.05
-        )
-
-        # Map boxes back to original ROI coordinates and paint mask
-        for (x, y, w, h) in boxes:
-            # Reverse the scaling
-            ox = int(x / scale)
-            oy = int(y / scale)
-            ow = int(w / scale)
-            oh = int(h / scale)
-            # Clamp to ROI bounds
-            ox = max(0, ox)
-            oy = max(0, oy)
-            ow = min(ow, rw - ox)
-            oh = min(oh, rh - oy)
-            # Dilate the mask a bit to cover limbs/edges
-            pad = max(5, int(ow * 0.2))
-            y1 = max(0, oy - pad)
-            y2 = min(rh, oy + oh + pad)
-            x1 = max(0, ox - pad)
-            x2 = min(rw, ox + ow + pad)
-            mask[y1:y2, x1:x2] = 255
-
-        return mask
-
-    def _improve_line_mask(self, gray_roi, human_mask):
-        """
-        Multi-method black line mask with human regions excluded.
+        Multi-method black line mask.
         Uses both global + adaptive thresholding for robustness.
         """
         # --- Method 1: Global threshold (works well for high-contrast lines) ---
@@ -214,11 +164,6 @@ class VisionAgent:
         kernel_close = np.ones((5, 5), np.uint8)
         mask_closed = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel_close)
 
-        # --- EXCLUDE HUMAN REGIONS ---
-        # Where human_mask is white, paint the line mask black (exclude)
-        mask_combined[human_mask > 0] = 0
-        mask_closed[human_mask > 0] = 0
-
         return mask_combined, mask_closed, mask_global, mask_adaptive, mask_color
 
     def process_frame(self, frame):
@@ -235,8 +180,7 @@ class VisionAgent:
             "line_ended": False,
             "is_dashed": False,
             "special_state": None,
-            "cnn_layers": None,
-            "human_detected": False
+            "cnn_layers": None
         }
 
         h, w = frame.shape[:2]
@@ -252,30 +196,11 @@ class VisionAgent:
         cv2.rectangle(frame, (roi_start_x, roi_start_y), (roi_end_x, h), (0, 255, 255), 2)
         cv2.putText(frame, "ROI", (roi_start_x, roi_start_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-        # --- HUMAN DETECTION (skip in simulation) ---
-        human_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
-        if not self.simulation_mode:
-            human_mask = self._detect_humans(roi)
-        if np.any(human_mask > 0):
-            result["human_detected"] = True
-            # Draw human detection boxes on the main frame for debug
-            contours_human, _ = cv2.findContours(human_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for ch in contours_human:
-                x, y, ww, hh = cv2.boundingRect(ch)
-                cv2.rectangle(frame, (x + roi_start_x, y + roi_start_y),
-                              (x + roi_start_x + ww, y + roi_start_y + hh),
-                              (255, 0, 255), 2)
-                cv2.putText(frame, "HUMAN (MASKED)", (x + roi_start_x, y + roi_start_y - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
-
         # --- RED LINE DETECTION ---
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask_red_1 = cv2.inRange(hsv_roi, np.array([0, 120, 70]), np.array([10, 255, 255]))
         mask_red_2 = cv2.inRange(hsv_roi, np.array([170, 120, 70]), np.array([180, 255, 255]))
         mask_red = cv2.bitwise_or(mask_red_1, mask_red_2)
-
-        # Exclude humans from red detection too
-        mask_red[human_mask > 0] = 0
 
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours_red:
@@ -309,7 +234,7 @@ class VisionAgent:
         gray_roi_for_line[mask_red > 0] = 255
 
         mask_black, mask_closed, mask_global, mask_adaptive, mask_color = \
-            self._improve_line_mask(gray_roi_for_line, human_mask)
+            self._improve_line_mask(gray_roi_for_line)
 
         b, g, r = cv2.split(roi)
         color_threshold = 50
