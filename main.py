@@ -18,6 +18,7 @@ def main():
         hw.stop()  # ensure motors off in sim
 
     print("Robot initialized. Starting main loop.")
+    print("[Main] Press 't' in the vision window to run PID self-tuning.")
 
     try:
         time.sleep(1.0)
@@ -44,9 +45,12 @@ def main():
                 for layer_name, layer_data in vision_data["cnn_layers"].items():
                     cv2.imshow(f"Vision Layer: {layer_name}", layer_data)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 print("[Main] 'q' pressed. Exiting loop.")
                 break
+            elif key == ord('t'):
+                control.start_autotune()
 
     except KeyboardInterrupt:
         print("Interrupted by user.")

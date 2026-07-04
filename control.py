@@ -69,6 +69,26 @@ class ControlAgent:
         # ---- DASHED LINE HANDLING ----
         self.dashed_countdown = 0  # frames to keep driving straight during a dashed gap
 
+        # ---- MOTOR OUTPUT SANITIZATION ----
+        # Below this duty cycle the motors can't overcome friction and just
+        # stall/buzz instead of turning, so any nonzero speed gets floored to it.
+        self.MIN_MOTOR_SPEED = 0.15
+        self.MAX_MOTOR_SPEED = 1.0
+
+        # ---- SELF-TUNING PID (relay / Ziegler-Nichols auto-tune) ----
+        # Add "AUTOTUNE" to the state machine: FOLLOWING | RED_TRACKING | TURNING |
+        # SPINNING | BACKTRACKING | RECOVERING | STOPPED | AUTOTUNE
+        self.RELAY_AMPLITUDE = 0.35        # turn magnitude used to force oscillation
+        self.AUTOTUNE_BASE_SPEED = 0.5 * self.base_speed
+        self.AUTOTUNE_CYCLES = 4           # full oscillation cycles to average over
+        self.AUTOTUNE_TIMEOUT_S = 20.0     # give up and keep old gains if it won't oscillate
+
+        self.autotune_start_time = 0.0
+        self.autotune_last_sign = 0
+        self.autotune_half_cycle_peak = 0.0
+        self.autotune_zero_crossings = []
+        self.autotune_peaks = []
+
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
@@ -111,6 +131,25 @@ class ControlAgent:
     # main entry
     # ------------------------------------------------------------------
     def calculate_speeds(self, vision_data):
+        left, right = self._calculate_speeds_raw(vision_data)
+        return self._sanitize_speeds(left, right)
+
+    def _sanitize_speeds(self, left, right):
+        """Clamp motor outputs to a valid, physically meaningful range.
+
+        Negative/over-range values from PID math are clamped to
+        [0.0, MAX_MOTOR_SPEED], and any nonzero speed below MIN_MOTOR_SPEED
+        is floored to it so the motors don't stall below their deadband.
+        """
+        def clean(speed):
+            speed = max(0.0, min(self.MAX_MOTOR_SPEED, speed))
+            if 0.0 < speed < self.MIN_MOTOR_SPEED:
+                speed = self.MIN_MOTOR_SPEED
+            return speed
+
+        return clean(left), clean(right)
+
+    def _calculate_speeds_raw(self, vision_data):
         current_time = time.time()
         dt = current_time - self.last_time
         self.last_time = current_time
@@ -120,6 +159,9 @@ class ControlAgent:
         # ---- state dispatch ----
         if self.state == "STOPPED":
             return 0.0, 0.0
+
+        if self.state == "AUTOTUNE":
+            return self._handle_autotune(vision_data, current_time)
 
         if self.state == "TURNING":
             return self._handle_turn(current_time)
@@ -380,3 +422,100 @@ class ControlAgent:
             return 0.6, 0.0
         else:
             return 0.0, 0.6
+
+    # ------------------------------------------------------------------
+    # Self-tuning PID (relay-based / Ziegler-Nichols auto-tune)
+    # ------------------------------------------------------------------
+    def start_autotune(self):
+        """Kick off a relay auto-tune run. Drives a bang-bang steering signal
+        to force the line-error into a sustained oscillation, measures its
+        period and amplitude, and derives new Kp/Ki/Kd from them."""
+        print("[Autotune] Starting relay-based PID auto-tune...")
+        self.state = "AUTOTUNE"
+        self.autotune_start_time = time.time()
+        self.autotune_last_sign = 0
+        self.autotune_half_cycle_peak = 0.0
+        self.autotune_zero_crossings = []
+        self.autotune_peaks = []
+
+    def _handle_autotune(self, vision_data, current_time):
+        cx = vision_data.get("line_center_x")
+        if cx is None:
+            print("[Autotune] Lost the line during auto-tune, aborting. Keeping previous gains.")
+            self.state = "RECOVERING"
+            return self._handle_recovery()
+
+        error = cx - self.target_x
+        # Same nonlinear transform _pid_follow applies before multiplying by
+        # Kp, so the identified gain lines up with how it will actually be used.
+        sign_now = 1 if error > 0 else (-1 if error < 0 else 0)
+        p_error = sign_now * (abs(error) ** self.nl_factor)
+
+        self.autotune_half_cycle_peak = max(self.autotune_half_cycle_peak, abs(p_error))
+
+        sign = sign_now if sign_now != 0 else self.autotune_last_sign
+        if self.autotune_last_sign != 0 and sign != 0 and sign != self.autotune_last_sign:
+            # Error crossed zero — a half-cycle of the forced oscillation just ended.
+            self.autotune_zero_crossings.append(current_time)
+            self.autotune_peaks.append(self.autotune_half_cycle_peak)
+            self.autotune_half_cycle_peak = 0.0
+        if sign != 0:
+            self.autotune_last_sign = sign
+
+        half_cycles_needed = self.AUTOTUNE_CYCLES * 2
+        timed_out = (current_time - self.autotune_start_time) > self.AUTOTUNE_TIMEOUT_S
+
+        if len(self.autotune_zero_crossings) >= half_cycles_needed + 1 or timed_out:
+            self._finish_autotune(timed_out)
+            return self.base_speed, self.base_speed
+
+        # Relay/bang-bang controller: full deflection based only on error sign,
+        # which is what forces the sustained oscillation the tuner measures.
+        turn = self.RELAY_AMPLITUDE if error >= 0 else -self.RELAY_AMPLITUDE
+        left = self.AUTOTUNE_BASE_SPEED + turn
+        right = self.AUTOTUNE_BASE_SPEED - turn
+        return left, right
+
+    def _finish_autotune(self, timed_out):
+        min_needed = self.AUTOTUNE_CYCLES * 2
+        if timed_out or len(self.autotune_zero_crossings) < min_needed:
+            print("[Autotune] Not enough oscillation detected, keeping existing PID gains.")
+            self.state = "FOLLOWING"
+            return
+
+        crossings = self.autotune_zero_crossings[-(min_needed):]
+        half_periods = [t2 - t1 for t1, t2 in zip(crossings[:-1], crossings[1:])]
+        peaks = self.autotune_peaks[-(min_needed):]
+
+        if not half_periods or not peaks:
+            print("[Autotune] Invalid oscillation data, keeping existing PID gains.")
+            self.state = "FOLLOWING"
+            return
+
+        Tu = 2.0 * (sum(half_periods) / len(half_periods))  # full oscillation period
+        a = sum(peaks) / len(peaks)                          # oscillation amplitude
+
+        if a <= 0 or Tu <= 0:
+            print("[Autotune] Invalid oscillation data, keeping existing PID gains.")
+            self.state = "FOLLOWING"
+            return
+
+        Ku = (4.0 * self.RELAY_AMPLITUDE) / (math.pi * a)  # ultimate gain
+
+        # Classic Ziegler-Nichols PID tuning rules from Ku/Tu.
+        new_kp = 0.6 * Ku
+        new_ki = 2.0 * new_kp / Tu
+        new_kd = new_kp * Tu / 8.0
+
+        # Guard against a noisy identification producing runaway gains.
+        new_kp = max(0.0001, min(0.05, new_kp))
+        new_ki = max(0.0, min(0.005, new_ki))
+        new_kd = max(0.0, min(0.05, new_kd))
+
+        print(f"[Autotune] Ku={Ku:.6f} Tu={Tu:.3f}s amplitude={a:.2f} -> "
+              f"Kp={new_kp:.6f} Ki={new_ki:.6f} Kd={new_kd:.6f}")
+
+        self.Kp, self.Ki, self.Kd = new_kp, new_ki, new_kd
+        self.integral = 0.0
+        self.last_error = 0.0
+        self.state = "FOLLOWING"
