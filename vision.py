@@ -2,38 +2,46 @@ import cv2
 import numpy as np
 
 class VisionAgent:
-    def __init__(self, resolution=(320, 240)):
+    def __init__(self, resolution=(320, 240), fps=120):
         self.resolution = resolution
-        self.use_picamera = False
+        self.fps = fps
+        self.camera_kind = None
+        self.camera = None
         self.simulation_mode = False
 
-        # On Raspberry Pi, try to open the camera directly via OpenCV (V4L2 backend).
-        # No picamera module needed.
-        print("[Vision] Opening camera via OpenCV (V4L2)...")
-        self.camera = None
-        for cam_index in [0, 1, 2]:
-            try:
-                cam = cv2.VideoCapture(cam_index, cv2.CAP_V4L2)
-                if not cam.isOpened():
-                    cam = cv2.VideoCapture(cam_index)
-                if cam.isOpened():
-                    ret, test_frame = cam.read()
-                    if ret and test_frame is not None:
-                        cam.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
-                        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-                        cam.set(cv2.CAP_PROP_FPS, 30)
-                        self.camera = cam
-                        actual_w = int(cam.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        actual_h = int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        print(f"[Vision] Camera opened at index {cam_index} ({actual_w}x{actual_h})")
-                        break
-                    cam.release()
-            except Exception as e:
-                print(f"[Vision] Index {cam_index} failed: {e}")
-                try:
-                    cam.release()
-                except Exception:
-                    pass
+        # Try Picamera2 first (works on Raspberry Pi), then fall back to cv2.VideoCapture
+        try:
+            from picamera2 import Picamera2
+            picam2 = Picamera2()
+            config = picam2.create_video_configuration(
+                main={"size": resolution, "format": "RGB888"},
+                controls={"FrameRate": fps},
+            )
+            picam2.configure(config)
+            picam2.start()
+            self.camera_kind = "picamera2"
+            self.camera = picam2
+            print(f"[Vision] Using Picamera2 at {resolution[0]}x{resolution[1]} @ {fps}fps")
+        except Exception as exc:
+            print(f"[Vision] Picamera2 unavailable: {exc}")
+            print("[Vision] Falling back to cv2.VideoCapture...")
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
+            cap.set(cv2.CAP_PROP_FPS, fps)
+            if cap.isOpened():
+                ret, test_frame = cap.read()
+                if ret and test_frame is not None:
+                    self.camera_kind = "cv2"
+                    self.camera = cap
+                    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+                    print(f"[Vision] Camera opened via cv2 ({actual_w}x{actual_h} @ {actual_fps}fps)")
+                else:
+                    cap.release()
+            else:
+                cap.release()
 
         if self.camera is None:
             print("[Vision] No camera found. Running in simulation mode.")
@@ -56,8 +64,8 @@ class VisionAgent:
                 yield test
         else:
             while True:
-                ret, frame = self.camera.read()
-                if not ret:
+                frame = self._read_frame()
+                if frame is None:
                     print("[Vision] Camera read failed. Reconnecting...")
                     self._reconnect_camera()
                     if self.camera is None:
@@ -65,33 +73,69 @@ class VisionAgent:
                     continue
                 yield frame
 
+    def _read_frame(self):
+        """Read a frame from the camera, handling both picamera2 and cv2 backends."""
+        if self.camera_kind == "picamera2":
+            try:
+                rgb = self.camera.capture_array()
+                return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            except Exception:
+                return None
+        elif self.camera_kind == "cv2":
+            ret, frame = self.camera.read()
+            return frame if ret else None
+        return None
+
     def _reconnect_camera(self):
         """Try to reconnect to the camera after a failure."""
         if self.camera is not None:
             try:
-                self.camera.release()
+                if self.camera_kind == "picamera2":
+                    self.camera.stop()
+                else:
+                    self.camera.release()
             except Exception:
                 pass
         import time
         time.sleep(1.0)
-        for cam_index in [0, 1, 2]:
-            try:
-                cam = cv2.VideoCapture(cam_index, cv2.CAP_V4L2)
-                if not cam.isOpened():
-                    cam = cv2.VideoCapture(cam_index)
-                if cam.isOpened():
-                    ret, _ = cam.read()
-                    if ret:
-                        cam.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
-                        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-                        self.camera = cam
-                        print(f"[Vision] Reconnected at index {cam_index}")
-                        return
-                cam.release()
-            except Exception:
-                pass
+
+        # Try Picamera2 first
+        try:
+            from picamera2 import Picamera2
+            picam2 = Picamera2()
+            config = picam2.create_video_configuration(
+                main={"size": self.resolution, "format": "RGB888"},
+                controls={"FrameRate": self.fps},
+            )
+            picam2.configure(config)
+            picam2.start()
+            self.camera_kind = "picamera2"
+            self.camera = picam2
+            print(f"[Vision] Reconnected via Picamera2 at {self.resolution[0]}x{self.resolution[1]} @ {self.fps}fps")
+            return
+        except Exception as exc:
+            print(f"[Vision] Picamera2 reconnect failed: {exc}")
+
+        # Fall back to cv2
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+        cap.set(cv2.CAP_PROP_FPS, self.fps)
+        if cap.isOpened():
+            ret, test_frame = cap.read()
+            if ret and test_frame is not None:
+                self.camera_kind = "cv2"
+                self.camera = cap
+                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                actual_fps = cap.get(cv2.CAP_PROP_FPS)
+                print(f"[Vision] Reconnected via cv2 ({actual_w}x{actual_h} @ {actual_fps}fps)")
+                return
+            cap.release()
+
         print("[Vision] Reconnect failed. No camera available.")
         self.camera = None
+        self.camera_kind = None
 
     def _detect_humans(self, roi):
         """HOG pedestrian detection on the ROI.
@@ -154,10 +198,9 @@ class VisionAgent:
             cv2.THRESH_BINARY_INV, 21, 8
         )
 
-        # --- Method 3: Color-based (very dark pixels across all channels) ---
-        b, g, r = cv2.split(blurred)
+        # --- Method 3: Strict intensity threshold (catches very dark pixels) ---
         mask_color = np.zeros_like(gray_roi)
-        mask_color[(b < 70) & (g < 70) & (r < 70)] = 255
+        mask_color[gray_roi < 70] = 255
 
         # Combine: a pixel is "line" if ANY method says so (union)
         mask_combined = cv2.bitwise_or(mask_global, mask_adaptive)
