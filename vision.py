@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 class VisionAgent:
-    def __init__(self, resolution=(320, 240), fps=120):
+    def __init__(self, resolution=(320, 240), fps=30):
         self.resolution = resolution
         self.fps = fps
         self.camera_kind = None
