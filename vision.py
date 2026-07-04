@@ -13,7 +13,9 @@ class VisionAgent:
         self.camera = None
         for cam_index in [0, 1, 2]:
             try:
-                cam = cv2.VideoCapture(cam_index)
+                cam = cv2.VideoCapture(cam_index, cv2.CAP_V4L2)
+                if not cam.isOpened():
+                    cam = cv2.VideoCapture(cam_index)
                 if cam.isOpened():
                     ret, test_frame = cam.read()
                     if ret and test_frame is not None:
@@ -36,7 +38,6 @@ class VisionAgent:
         if self.camera is None:
             print("[Vision] No camera found. Running in simulation mode.")
             self.simulation_mode = True
-            return
 
         # HOG pedestrian detector (built into OpenCV, no extra files needed)
         self.hog = cv2.HOGDescriptor()
@@ -75,7 +76,9 @@ class VisionAgent:
         time.sleep(1.0)
         for cam_index in [0, 1, 2]:
             try:
-                cam = cv2.VideoCapture(cam_index)
+                cam = cv2.VideoCapture(cam_index, cv2.CAP_V4L2)
+                if not cam.isOpened():
+                    cam = cv2.VideoCapture(cam_index)
                 if cam.isOpened():
                     ret, _ = cam.read()
                     if ret:
@@ -206,8 +209,10 @@ class VisionAgent:
         cv2.rectangle(frame, (roi_start_x, roi_start_y), (roi_end_x, h), (0, 255, 255), 2)
         cv2.putText(frame, "ROI", (roi_start_x, roi_start_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-        # --- HUMAN DETECTION ---
-        human_mask = self._detect_humans(roi)
+        # --- HUMAN DETECTION (skip in simulation) ---
+        human_mask = np.zeros((roi_h, roi_w), dtype=np.uint8)
+        if not self.simulation_mode:
+            human_mask = self._detect_humans(roi)
         if np.any(human_mask > 0):
             result["human_detected"] = True
             # Draw human detection boxes on the main frame for debug
