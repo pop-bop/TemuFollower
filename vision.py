@@ -4,7 +4,6 @@ import numpy as np
 class VisionAgent:
     def __init__(self, resolution=(320, 240)):
         self.resolution = resolution
-        # Try to initialize PiCamera, fallback to standard cv2 VideoCapture
         self.use_picamera = False
         try:
             from picamera.array import PiRGBArray
@@ -14,7 +13,6 @@ class VisionAgent:
             self.camera.framerate = 30
             self.rawCapture = PiRGBArray(self.camera, size=self.resolution)
             self.use_picamera = True
-            # Let camera warmup
             import time
             time.sleep(0.1)
         except ImportError:
@@ -22,9 +20,12 @@ class VisionAgent:
             self.camera = cv2.VideoCapture(0)
             self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
             self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-            
+
+        # HOG pedestrian detector (built into OpenCV, no extra files needed)
+        self.hog = cv2.HOGDescriptor()
+        self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+
     def get_frame(self):
-        """Yields frames from the chosen camera."""
         if self.use_picamera:
             for frame in self.camera.capture_continuous(self.rawCapture, format="bgr", use_video_port=True):
                 img = frame.array
@@ -37,111 +38,180 @@ class VisionAgent:
                     break
                 yield frame
 
+    def _detect_humans(self, roi):
+        """
+        HOG pedestrian detection on the ROI.
+        Returns a binary mask (same size as ROI) where white = human region.
+        """
+        mask = np.zeros(roi.shape[:2], dtype=np.uint8)
+        if roi.size == 0:
+            return mask
+
+        # HOG needs a reasonably sized image; resize ROI up for better detection
+        rh, rw = roi.shape[:2]
+        scale = max(1.0, 64.0 / rh)  # ensure minimum height for HOG
+        if scale > 1.0:
+            roi_scaled = cv2.resize(roi, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        else:
+            roi_scaled = roi
+
+        # Multi-scale detection with different winStride and padding
+        boxes, weights = self.hog.detectMultiScale(
+            roi_scaled,
+            winStride=(4, 4),
+            padding=(8, 8),
+            scale=1.05
+        )
+
+        # Map boxes back to original ROI coordinates and paint mask
+        for (x, y, w, h) in boxes:
+            # Reverse the scaling
+            ox = int(x / scale)
+            oy = int(y / scale)
+            ow = int(w / scale)
+            oh = int(h / scale)
+            # Clamp to ROI bounds
+            ox = max(0, ox)
+            oy = max(0, oy)
+            ow = min(ow, rw - ox)
+            oh = min(oh, rh - oy)
+            # Dilate the mask a bit to cover limbs/edges
+            pad = max(5, int(ow * 0.2))
+            y1 = max(0, oy - pad)
+            y2 = min(rh, oy + oh + pad)
+            x1 = max(0, ox - pad)
+            x2 = min(rw, ox + ow + pad)
+            mask[y1:y2, x1:x2] = 255
+
+        return mask
+
+    def _improve_line_mask(self, gray_roi, human_mask):
+        """
+        Multi-method black line mask with human regions excluded.
+        Uses both global + adaptive thresholding for robustness.
+        """
+        # --- Method 1: Global threshold (works well for high-contrast lines) ---
+        blurred = cv2.GaussianBlur(gray_roi, (5, 5), 0)
+        _, mask_global = cv2.threshold(blurred, 90, 255, cv2.THRESH_BINARY_INV)
+
+        # --- Method 2: Adaptive threshold (handles shadows, uneven lighting) ---
+        mask_adaptive = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 21, 8
+        )
+
+        # --- Method 3: Color-based (very dark pixels across all channels) ---
+        b, g, r = cv2.split(blurred)
+        mask_color = np.zeros_like(gray_roi)
+        mask_color[(b < 70) & (g < 70) & (r < 70)] = 255
+
+        # Combine: a pixel is "line" if ANY method says so (union)
+        mask_combined = cv2.bitwise_or(mask_global, mask_adaptive)
+        mask_combined = cv2.bitwise_or(mask_combined, mask_color)
+
+        # Morphological cleanup
+        kernel_open = np.ones((3, 3), np.uint8)
+        mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_OPEN, kernel_open)
+
+        # CLOSE to bridge small gaps in solid lines
+        kernel_close = np.ones((5, 5), np.uint8)
+        mask_closed = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel_close)
+
+        # --- EXCLUDE HUMAN REGIONS ---
+        # Where human_mask is white, paint the line mask black (exclude)
+        mask_combined[human_mask > 0] = 0
+        mask_closed[human_mask > 0] = 0
+
+        return mask_combined, mask_closed, mask_global, mask_adaptive, mask_color
+
     def process_frame(self, frame):
         """
-        Processes a single frame using the AlexNet-style multi-kernel filter bank.
-        Returns a dict containing line position, obstacle info, etc.
+        Processes a single frame for line following and maze solving.
+        Returns a dict containing line position, red line tracking, and special states.
         """
         result = {
             "line_center_x": None,
             "line_center_y": None,
-            "obstacle_detected": False,
-            "obstacle_box": None,
-            "special_state": None, # e.g., "intersection", "gap"
-            "cnn_layers": None
+            "red_line_detected": False,
+            "red_line_center_x": None,
+            "red_line_center_y": None,
+            "line_ended": False,
+            "is_dashed": False,
+            "special_state": None,
+            "cnn_layers": None,
+            "human_detected": False
         }
-        
+
         h, w = frame.shape[:2]
-        
-        # 1. Preprocessing (Crop to middle bottom box for zig-zag tracking)
+
+        # ROI: bottom-middle 40% width, bottom 40% height
         roi_start_y = int(h * 0.6)
         roi_start_x = int(w * 0.3)
         roi_end_x = int(w * 0.7)
         roi = frame[roi_start_y:, roi_start_x:roi_end_x]
         roi_h = roi.shape[0]
         roi_w = roi.shape[1]
-        
-        # Draw a yellow box on the main frame to indicate the exact ROI being used
+
         cv2.rectangle(frame, (roi_start_x, roi_start_y), (roi_end_x, h), (0, 255, 255), 2)
-        cv2.putText(frame, "ROI (Yellow Box)", (roi_start_x, roi_start_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        
-        # 2. Red Detection (Obstacles vs Stop Lines)
+        cv2.putText(frame, "ROI", (roi_start_x, roi_start_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # --- HUMAN DETECTION ---
+        human_mask = self._detect_humans(roi)
+        if np.any(human_mask > 0):
+            result["human_detected"] = True
+            # Draw human detection boxes on the main frame for debug
+            contours_human, _ = cv2.findContours(human_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for ch in contours_human:
+                x, y, ww, hh = cv2.boundingRect(ch)
+                cv2.rectangle(frame, (x + roi_start_x, y + roi_start_y),
+                              (x + roi_start_x + ww, y + roi_start_y + hh),
+                              (255, 0, 255), 2)
+                cv2.putText(frame, "HUMAN (MASKED)", (x + roi_start_x, y + roi_start_y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+
+        # --- RED LINE DETECTION ---
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask_red_1 = cv2.inRange(hsv_roi, np.array([0, 120, 70]), np.array([10, 255, 255]))
         mask_red_2 = cv2.inRange(hsv_roi, np.array([170, 120, 70]), np.array([180, 255, 255]))
-        mask_red = mask_red_1 + mask_red_2
-        
+        mask_red = cv2.bitwise_or(mask_red_1, mask_red_2)
+
+        # Exclude humans from red detection too
+        mask_red[human_mask > 0] = 0
+
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours_red:
             largest_red = max(contours_red, key=cv2.contourArea)
-            if cv2.contourArea(largest_red) > 500: # Threshold for a valid object
+            if cv2.contourArea(largest_red) > 300:
                 x, y, w_box, h_box = cv2.boundingRect(largest_red)
                 real_y = y + roi_start_y
                 real_x = x + roi_start_x
-                
-                # Check aspect ratio: wide objects are lines, square objects are cubes
                 aspect_ratio = float(w_box) / max(1, h_box)
-                
-                if aspect_ratio > 3.0: # Red Line
-                    # Only trigger STOP if the line is physically beneath the robot (bottom 25% of the frame)
+
+                result["red_line_detected"] = True
+                result["red_line_center_x"] = real_x + w_box // 2
+                result["red_line_center_y"] = real_y + h_box // 2
+
+                if aspect_ratio > 2.0:
+                    cv2.rectangle(frame, (real_x, real_y), (real_x + w_box, real_y + h_box), (0, 0, 255), -1)
+                    cv2.putText(frame, "RED LINE (TRACK)", (real_x, real_y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     if real_y > frame.shape[0] * 0.75:
-                        result["special_state"] = "red_line_bottom"
-                        cv2.rectangle(frame, (real_x, real_y), (real_x + w_box, real_y + h_box), (0, 0, 255), -1) # Fill red
-                        cv2.putText(frame, "RED STOP LINE (BENEATH)", (real_x, real_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    else:
-                        # Line is visible but still ahead, do not stop yet
-                        result["special_state"] = "red_line_ahead"
-                        cv2.rectangle(frame, (real_x, real_y), (real_x + w_box, real_y + h_box), (0, 0, 255), 2)
-                        cv2.putText(frame, "Red Line Ahead", (real_x, real_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                else: # Red Cube (Obstacle)
-                    result["obstacle_detected"] = True
-                    result["obstacle_box"] = (real_x, real_y, w_box, h_box)
-                    cv2.rectangle(frame, (real_x, real_y), (real_x + w_box, real_y + h_box), (0, 0, 255), 3)
-                    cv2.putText(frame, "Obstacle Cube", (real_x, real_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                    
-        # 2.5 Green Detection (Green Square)
-        mask_green = cv2.inRange(hsv_roi, np.array([35, 100, 100]), np.array([85, 255, 255]))
-        contours_green, _ = cv2.findContours(mask_green, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours_green:
-            largest_green = max(contours_green, key=cv2.contourArea)
-            if cv2.contourArea(largest_green) > 500:
-                x, y, w_box, h_box = cv2.boundingRect(largest_green)
-                real_y = y + roi_start_y
-                real_x = x + roi_start_x
-                aspect_ratio = float(w_box) / max(1, h_box)
-                
-                # Check for square shape (aspect ratio between 0.5 and 2.0)
-                if 0.5 < aspect_ratio < 2.0:
-                    if real_y > frame.shape[0] * 0.75: # Beneath the robot
-                        result["special_state"] = "green_square_bottom"
-                        cv2.rectangle(frame, (real_x, real_y), (real_x + w_box, real_y + h_box), (0, 255, 0), -1)
-                        cv2.putText(frame, "GREEN SQUARE (BENEATH)", (real_x, real_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-                    else:
-                        result["special_state"] = "green_square_ahead"
-                        cv2.rectangle(frame, (real_x, real_y), (real_x + w_box, real_y + h_box), (0, 255, 0), 2)
-                        cv2.putText(frame, "Green Square Ahead", (real_x, real_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                
-        # 3. Strictly Black Line Detection
-        # Convert to grayscale and smooth to reduce high-frequency noise
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Paint the obstacle pixels out of the input so it doesn't track them
-        blurred[mask_red > 0] = 255
-        
-        # Use a strict Global Threshold to isolate the black line.
-        # Any pixel darker than 80 becomes 255 (White in the mask).
-        # Any pixel lighter than 80 (the white paper) becomes 0 (Black in the mask).
-        _, mask_black = cv2.threshold(blurred, 80, 255, cv2.THRESH_BINARY_INV)
-        
-        # Morphological OPEN to remove tiny speckle noise
-        kernel_open = np.ones((3, 3), np.uint8)
-        mask_black = cv2.morphologyEx(mask_black, cv2.MORPH_OPEN, kernel_open)
-        
-        # Morphological CLOSE to bridge small gaps in the solid line block
-        kernel_close = np.ones((9, 9), np.uint8)
-        mask_closed = cv2.morphologyEx(mask_black, cv2.MORPH_CLOSE, kernel_close)
-        
+                        result["special_state"] = "red_line_beneath"
+                else:
+                    cv2.rectangle(frame, (real_x, real_y), (real_x + w_box, real_y + h_box), (0, 0, 255), 2)
+                    cv2.putText(frame, "RED TARGET", (real_x, real_y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        # --- IMPROVED BLACK LINE DETECTION ---
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        # Paint out red so it doesn't interfere with line detection
+        gray_roi_for_line = gray_roi.copy()
+        gray_roi_for_line[mask_red > 0] = 255
+
+        mask_black, mask_closed, mask_global, mask_adaptive, mask_color = \
+            self._improve_line_mask(gray_roi_for_line, human_mask)
+
         b, g, r = cv2.split(roi)
         color_threshold = 50
         no_color = np.zeros_like(b)
@@ -155,82 +225,144 @@ class VisionAgent:
             "B_Channel": b,
             "No_Color_Channel": no_color
         }
-        
-        # 4. Extract line position using Contours
-        contours_line, _ = cv2.findContours(mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+
+        # --- LINE POSITION + DASHED vs END-OF-LINE ---
+        contours_line, _ = cv2.findContours(mask_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
         if contours_line:
-            # Filter contours geometrically to match the exact ~10px width of the line
             valid_contours = []
             for c in contours_line:
                 area = cv2.contourArea(c)
-                if area < 50: # Lowered area floor since the line is much thinner now
+                if area < 25:
                     continue
-                    
-                # Use minAreaRect to get the true physical width/height regardless of rotation
                 rect = cv2.minAreaRect(c)
                 rect_w, rect_h = rect[1]
                 if rect_w == 0 or rect_h == 0:
                     continue
-                    
                 min_dim = min(rect_w, rect_h)
                 max_dim = max(rect_w, rect_h)
-                
-                # Constraint 1: "10 pixels wide" (We allow 5 to 30 to account for camera blur/distance)
-                if not (5 <= min_dim <= 30):
+
+                # Line width filter: allow thin lines (3-40px)
+                if not (3 <= min_dim <= 40):
                     continue
-                    
-                valid_contours.append(c)
-                
+
+                # Extent filter: reject blobs that are too square/round (not line-like)
+                extent = area / (max_dim * min_dim) if max_dim * min_dim > 0 else 0
+                if extent < 0.15:
+                    continue
+
+                # Aspect ratio filter: line should be elongated
+                aspect = max_dim / max(1, min_dim)
+                if aspect < 1.2:
+                    # Nearly square — could be a dot or intersection marker, still valid but deprioritize
+                    pass
+
+                valid_contours.append((c, area, max_dim))
+
             if valid_contours:
-                largest_line = max(valid_contours, key=cv2.contourArea)
-                
-                # Use geometric moments to find the center of gravity of the black line
+                # Sort by area, but prefer elongated contours
+                valid_contours.sort(key=lambda x: x[1], reverse=True)
+                largest_line = valid_contours[0][0]
+
                 M = cv2.moments(largest_line)
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"]) + roi_start_x
                     cy = int(M["m01"] / M["m00"]) + roi_start_y
                     result["line_center_x"] = cx
                     result["line_center_y"] = cy
-                    
+
                     shifted_contour = largest_line + np.array([roi_start_x, roi_start_y])
-                    
-                    # Fit a line to the contour to calculate the directional heading vector
+
+                    # Fit line for heading vector
                     [vx, vy, x, y] = cv2.fitLine(shifted_contour, cv2.DIST_L2, 0, 0.01, 0.01)
-                    
-                    # Extracted values are 1D numpy arrays, unwrap them to scalar floats
                     vx = vx.item()
                     vy = vy.item()
-                    
-                    # Ensure the heading vector always points "forward" (up the screen, so negative Y)
                     if vy > 0:
                         vx = -vx
                         vy = -vy
-                        
-                    # Draw a fitted shape (Ellipse) around the line contour to highlight it
+
                     if len(shifted_contour) >= 5:
                         ellipse = cv2.fitEllipse(shifted_contour)
                         cv2.ellipse(frame, ellipse, (255, 100, 0), 2)
                     else:
                         cv2.drawContours(frame, [shifted_contour], -1, (255, 100, 0), 2)
-                        
-                    # Draw the heading vector arrow extending from the center of gravity
+
                     length = 70
                     pt1 = (cx, cy)
                     pt2 = (int(cx + vx * length), int(cy + vy * length))
                     cv2.arrowedLine(frame, pt1, pt2, (0, 255, 255), 4, tipLength=0.3)
-                    
+
                     cv2.circle(frame, (cx, cy), 6, (0, 0, 255), -1)
-                    cv2.putText(frame, f"Vector Heading CX:{cx}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                    
-                    # Basic intersection detection
+                    cv2.putText(frame, f"CX:{cx}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                    # --- INTERSECTION DETECTION ---
                     x_box, y_box, w_line, h_line = cv2.boundingRect(largest_line)
-                    if w_line > roi_w * 0.8: # Line edge takes up 80% of ROI width
+                    if w_line > roi_w * 0.8:
                         result["special_state"] = "intersection"
                         cv2.putText(frame, "INTERSECTION", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             else:
-                result["special_state"] = "gap"
+                result["line_center_x"] = None
+                result["line_center_y"] = None
+
+                # --- DASHED vs END-OF-LINE (improved analysis) ---
+                # Use multiple scan lines across the ROI width, not just center
+                scan_cols = [roi_w // 4, roi_w // 2, 3 * roi_w // 4]
+                total_top = 0
+                total_bottom = 0
+                total_pixels = 0
+
+                for sx in scan_cols:
+                    strip = mask_black[:, max(0, sx - 3):sx + 3]
+                    col_sum = np.sum(strip > 0, axis=1)
+                    mid = roi_h // 2
+                    total_top += np.sum(col_sum[:mid] > 0)
+                    total_bottom += np.sum(col_sum[mid:] > 0)
+
+                total_pixels = np.sum(mask_black > 0)
+                black_ratio = total_pixels / (roi_h * roi_w) if roi_h * roi_w > 0 else 0
+
+                # Also check the UNCLOSED mask for scattered pixels (dashed pattern)
+                # Dashed lines have periodic black blobs; dead ends have none ahead
+                row_coverage = np.sum(mask_black > 0, axis=1)
+                # Find the topmost row that has any black pixels
+                nonzero_rows = np.where(row_coverage > 0)[0]
+                if len(nonzero_rows) > 0:
+                    topmost_black_row = nonzero_rows[0]
+                    bottommost_black_row = nonzero_rows[-1]
+                    span = bottommost_black_row - topmost_black_row
+                    span_ratio = span / roi_h if roi_h > 0 else 0
+                else:
+                    span_ratio = 0
+
+                # Decision logic
+                if total_top > 0 and black_ratio > 0.015:
+                    # Black pixels in upper half => line continues beyond ROI => dashed gap
+                    result["is_dashed"] = True
+                    result["special_state"] = "dashed_gap"
+                    cv2.putText(frame, "DASHED GAP", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                elif total_bottom > 0 and total_top == 0 and span_ratio < 0.5:
+                    # Black only at bottom, small span => line truly ends
+                    result["line_ended"] = True
+                    result["special_state"] = "dead_end"
+                    cv2.putText(frame, "DEAD END (180)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                elif total_bottom > 0 and span_ratio >= 0.5:
+                    # Decent vertical span but nothing at top — likely end of line
+                    result["line_ended"] = True
+                    result["special_state"] = "dead_end"
+                    cv2.putText(frame, "DEAD END (180)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                else:
+                    # Very few or no black pixels — assume dashed gap (safer: keep driving)
+                    if black_ratio > 0.003:
+                        result["is_dashed"] = True
+                        result["special_state"] = "dashed_gap"
+                        cv2.putText(frame, "DASHED GAP", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    else:
+                        result["line_ended"] = True
+                        result["special_state"] = "dead_end"
+                        cv2.putText(frame, "DEAD END (180)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         else:
-            result["special_state"] = "gap"
-            
+            result["line_ended"] = True
+            result["special_state"] = "dead_end"
+            cv2.putText(frame, "DEAD END (180)", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
         return result
