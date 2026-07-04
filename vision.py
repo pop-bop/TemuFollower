@@ -5,42 +5,93 @@ class VisionAgent:
     def __init__(self, resolution=(320, 240)):
         self.resolution = resolution
         self.use_picamera = False
-        try:
-            from picamera.array import PiRGBArray
-            from picamera import PiCamera
-            self.camera = PiCamera()
-            self.camera.resolution = self.resolution
-            self.camera.framerate = 30
-            self.rawCapture = PiRGBArray(self.camera, size=self.resolution)
-            self.use_picamera = True
-            import time
-            time.sleep(0.1)
-        except ImportError:
-            print("picamera module not found, using cv2.VideoCapture(0) instead.")
-            self.camera = cv2.VideoCapture(0)
-            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
-            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+        self.simulation_mode = False
+
+        # On Raspberry Pi, try to open the camera directly via OpenCV (V4L2 backend).
+        # No picamera module needed.
+        print("[Vision] Opening camera via OpenCV (V4L2)...")
+        self.camera = None
+        for cam_index in [0, 1, 2]:
+            try:
+                cam = cv2.VideoCapture(cam_index)
+                if cam.isOpened():
+                    ret, test_frame = cam.read()
+                    if ret and test_frame is not None:
+                        cam.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+                        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+                        cam.set(cv2.CAP_PROP_FPS, 30)
+                        self.camera = cam
+                        actual_w = int(cam.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        actual_h = int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        print(f"[Vision] Camera opened at index {cam_index} ({actual_w}x{actual_h})")
+                        break
+                    cam.release()
+            except Exception as e:
+                print(f"[Vision] Index {cam_index} failed: {e}")
+                try:
+                    cam.release()
+                except Exception:
+                    pass
+
+        if self.camera is None:
+            print("[Vision] No camera found. Running in simulation mode.")
+            self.simulation_mode = True
+            return
 
         # HOG pedestrian detector (built into OpenCV, no extra files needed)
         self.hog = cv2.HOGDescriptor()
         self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
     def get_frame(self):
-        if self.use_picamera:
-            for frame in self.camera.capture_continuous(self.rawCapture, format="bgr", use_video_port=True):
-                img = frame.array
-                self.rawCapture.truncate(0)
-                yield img
+        if self.simulation_mode:
+            print("[Vision] Simulation mode — generating test frames. Press 'q' in OpenCV window to exit.")
+            while True:
+                test = np.ones((self.resolution[1], self.resolution[0], 3), dtype=np.uint8) * 220
+                cx = self.resolution[0] // 2
+                cv2.line(test, (cx, int(self.resolution[1] * 0.4)),
+                         (cx + 15, self.resolution[1]), (20, 20, 20), 4)
+                noise = np.random.randint(0, 15, test.shape, dtype=np.uint8)
+                test = cv2.add(test, noise)
+                yield test
         else:
             while True:
                 ret, frame = self.camera.read()
                 if not ret:
-                    break
+                    print("[Vision] Camera read failed. Reconnecting...")
+                    self._reconnect_camera()
+                    if self.camera is None:
+                        break
+                    continue
                 yield frame
 
+    def _reconnect_camera(self):
+        """Try to reconnect to the camera after a failure."""
+        if self.camera is not None:
+            try:
+                self.camera.release()
+            except Exception:
+                pass
+        import time
+        time.sleep(1.0)
+        for cam_index in [0, 1, 2]:
+            try:
+                cam = cv2.VideoCapture(cam_index)
+                if cam.isOpened():
+                    ret, _ = cam.read()
+                    if ret:
+                        cam.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+                        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+                        self.camera = cam
+                        print(f"[Vision] Reconnected at index {cam_index}")
+                        return
+                cam.release()
+            except Exception:
+                pass
+        print("[Vision] Reconnect failed. No camera available.")
+        self.camera = None
+
     def _detect_humans(self, roi):
-        """
-        HOG pedestrian detection on the ROI.
+        """HOG pedestrian detection on the ROI.
         Returns a binary mask (same size as ROI) where white = human region.
         """
         mask = np.zeros(roi.shape[:2], dtype=np.uint8)

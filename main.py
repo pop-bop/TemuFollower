@@ -11,6 +11,12 @@ def main():
     vision = VisionAgent(resolution=(320, 240))
     control = ControlAgent(target_x_center=160, base_speed=1.0)
 
+    sim_mode = getattr(vision, 'simulation_mode', False)
+    if sim_mode:
+        print("[Main] Running in SIMULATION mode (no camera found). "
+              "Test frames will be generated. Press 'q' in OpenCV window to exit.")
+        hw.stop()  # ensure motors off in sim
+
     print("Robot initialized. Starting main loop.")
 
     try:
@@ -23,7 +29,8 @@ def main():
             left_speed, right_speed = control.calculate_speeds(vision_data)
 
             print(f"[Main] State: {control.state} | Left: {left_speed:.2f} Right: {right_speed:.2f}")
-            hw.set_speeds(left_speed, right_speed)
+            if not sim_mode:
+                hw.set_speeds(left_speed, right_speed)
 
             # Indicator logic based on new state machine
             red_led = (control.state == "STOPPED")
