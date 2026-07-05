@@ -44,6 +44,8 @@ def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_rati
         "roi_frame": roi,
         "red_marker": False,
         "green_marker": False,
+        "line_area": 0.0,
+        "line_confidence": 0.0,
     }
 
     contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -51,7 +53,10 @@ def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_rati
         return None, debug_info
 
     largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < MIN_LINE_AREA:
+    line_area = cv2.contourArea(largest)
+    debug_info["line_area"] = line_area
+    debug_info["line_confidence"] = clamp(line_area / max(float(MIN_LINE_AREA * 8), 1.0), 0.0, 1.0)
+    if line_area < MIN_LINE_AREA:
         return None, debug_info
 
     near_line_zone = np.zeros(black_mask.shape, dtype=np.uint8)

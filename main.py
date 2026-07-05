@@ -9,7 +9,8 @@ from config import (
     SHARP_TURN_SPEED, MAX_TURN_SPEED, STEER_INVERT,
     BASE_SPEED, MAX_SPEED, MIN_SPEED, SPIN_SEARCH_SPEED, APPROACH_SPEED,
     LINE_LOST_STOP_TIMEOUT_S, SLEW_RATE_PER_S, MANUAL_SPEED, MANUAL_KEY_TIMEOUT_S,
-    SHOW_DEBUG_VIEW,
+    SHOW_DEBUG_VIEW, DEBUG_VIEW_EVERY_N_FRAMES, LOOP_LOG_INTERVAL_S,
+    INTEGRAL_LIMIT, LOW_CONFIDENCE_SPEED_SCALE,
     MARKER_ACTION_DELAY_S,
     RED_LED_PIN, GREEN_LED_PIN,
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
@@ -29,6 +30,7 @@ from indicators import (
 from utils import clamp
 from debug_view import draw_debug_view, draw_roi_arrow_view
 from buffer import TemporalBuffer
+from adaptive_pid import schedule_pid_gains
 
 
 def main():
@@ -71,6 +73,12 @@ def main():
     rotate_settle_until = None
     last_intersection_time = 0.0
     dead_end_recorded = False
+    frame_count = 0
+    last_log_time = time.perf_counter()
+    fps_ema = 0.0
+    current_kp = KP
+    current_ki = KI
+    current_kd = KD
 
     print("PID line following running. Press Ctrl+C to stop.")
     print("Manual indicator test keys: r=toggle red LED, g=toggle green LED, b=buzzer blip")
@@ -82,6 +90,9 @@ def main():
             dt = max(0.001, now - last_time)
             last_time = now
             max_step = SLEW_RATE_PER_S * dt
+            frame_count += 1
+            instant_fps = 1.0 / dt
+            fps_ema = instant_fps if fps_ema <= 0.0 else (fps_ema * 0.9) + (instant_fps * 0.1)
 
             key = -1
             if SHOW_DEBUG_VIEW:
@@ -184,11 +195,13 @@ def main():
                 prev_state = state
 
                 _, active_debug = find_line_error_normal(frame)
-                if SHOW_DEBUG_VIEW:
+                if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
                     draw_debug_view(frame, active_debug, None, None, applied_left, applied_right, state)
                     draw_roi_arrow_view(active_debug, applied_left, applied_right, state)
 
-                print(f"state={state:16s} applied L/R={applied_left:+.2f}/{applied_right:+.2f}")
+                if now - last_log_time >= LOOP_LOG_INTERVAL_S:
+                    last_log_time = now
+                    print(f"state={state:16s} applied L/R={applied_left:+.2f}/{applied_right:+.2f} fps={fps_ema:.1f}")
                 continue
 
             # ===== AUTO MODE: VISION + STATE MACHINE =====
@@ -316,10 +329,16 @@ def main():
                 dead_end_recorded = False
                 error = normal_error
                 integral += error * dt
+                integral = clamp(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
                 derivative = (error - last_error) / dt
                 last_error = error
 
-                raw_turn = (KP * error) + (KI * integral) + (KD * derivative)
+                line_confidence = normal_debug.get("line_confidence", 1.0)
+                current_kp, current_ki, current_kd = schedule_pid_gains(
+                    KP, KI, KD, error, derivative, line_confidence,
+                )
+
+                raw_turn = (current_kp * error) + (current_ki * integral) + (current_kd * derivative)
                 raw_turn = clamp(raw_turn, -TURN_LIMIT, TURN_LIMIT)
                 display_turn = raw_turn
                 motor_turn = -raw_turn if STEER_INVERT else raw_turn
@@ -336,6 +355,12 @@ def main():
                     turn_sign = 1.0 if motor_turn >= 0 else -1.0
                     target_forward = BASE_SPEED * (1.0 - blend)
                     target_turn = motor_turn * (1.0 - blend) + (SHARP_TURN_SPEED * turn_sign) * blend
+
+                if line_confidence < 0.5:
+                    confidence_scale = LOW_CONFIDENCE_SPEED_SCALE + (
+                        (1.0 - LOW_CONFIDENCE_SPEED_SCALE) * line_confidence * 2.0
+                    )
+                    target_forward *= clamp(confidence_scale, LOW_CONFIDENCE_SPEED_SCALE, 1.0)
 
                 search_direction = 1.0 if error >= 0 else -1.0
                 if STEER_INVERT:
@@ -435,7 +460,7 @@ def main():
                 pending_marker_action_time = None
 
             if halted:
-                if SHOW_DEBUG_VIEW:
+                if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
                     cv2.imshow("Camera + Decisions", frame)
                 update_led(red_led_state, RED_LED_PIN, now)
                 update_led(green_led_state, GREEN_LED_PIN, now)
@@ -499,7 +524,7 @@ def main():
             update_led(green_led_state, GREEN_LED_PIN, now)
             update_buzzer(buzzer_state, buzzer_pwm, now)
 
-            if SHOW_DEBUG_VIEW:
+            if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
                 draw_debug_view(
                     frame, active_debug,
                     normal_error if state == "FOLLOW" else None,
@@ -508,11 +533,14 @@ def main():
                 lean_ratio = (display_turn / TURN_LIMIT) if display_turn is not None else None
                 draw_roi_arrow_view(active_debug, applied_left, applied_right, state, lean_ratio)
 
-            loop_ms = dt * 1000.0
-            print(
-                f"state={state:12s} forward={applied_forward:+.2f} turn={turn_component:+.2f}  "
-                f"applied L/R={applied_left:+.2f}/{applied_right:+.2f}  loop_ms={loop_ms:.1f}"
-            )
+            if now - last_log_time >= LOOP_LOG_INTERVAL_S:
+                last_log_time = now
+                loop_ms = dt * 1000.0
+                print(
+                    f"state={state:12s} forward={applied_forward:+.2f} turn={turn_component:+.2f}  "
+                    f"L/R={applied_left:+.2f}/{applied_right:+.2f}  loop_ms={loop_ms:.1f} "
+                    f"fps={fps_ema:.1f} pid={current_kp:.2f}/{current_ki:.2f}/{current_kd:.2f}"
+                )
 
     except KeyboardInterrupt:
         print("stopping")
