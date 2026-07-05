@@ -20,9 +20,10 @@ class MazeNode:
 
 
 class ControlAgent:
-    def __init__(self, target_x_center=160, base_speed=1.0):
+    def __init__(self, target_x_center=160, base_speed=1.0, reactive_only=False, steer_invert=True):
         self.target_x = target_x_center
         self.base_speed = base_speed
+        self.reactive_only = reactive_only  # If True, only PID follow — no maze memory
 
         # PID constants
         self.Kp = 0.003
@@ -34,54 +35,46 @@ class ControlAgent:
         self.last_error = 0
         self.last_time = time.time()
 
-        # ---- MAZE SOLVING STATE ----
-        # Current position in grid coordinates (start at 0,0)
+        # ---- MAZE SOLVING STATE (disabled in reactive_only mode) ----
         self.grid_x = 0
         self.grid_y = 0
-        # Heading: 0=forward(+Y), 1=right(+X), 2=backward(-Y), 3=left(-X)
         self.heading = 0
-
-        # Node map: (grid_x, grid_y) -> MazeNode
         self.nodes = {}
-        self._get_or_create_node(0, 0)
+        if not self.reactive_only:
+            self._get_or_create_node(0, 0)
 
-        # Stack for DFS exploration (micromouse flood-fill style)
-        self.explore_stack = []  # list of (node, direction_we_came_from)
-        self.backtrack_path = deque()  # path to follow when backtracking
-
-        # State machine
+        self.explore_stack = []
+        self.backtrack_path = deque()
         self.state = "FOLLOWING"
-        # FOLLOWING | APPROACH | TURNING | SPINNING | BACKTRACKING | RECOVERING | STOPPED | AUTOTUNE
-
         self.last_known_error = 0
         self.turn_start_time = 0
-        self.turn_duration = 0.0
+        self.turn_direction = "forward"
+        self.turn_min_duration = 0.0
+        self.turn_max_duration = 0.0
         self.turn_left_speed = 0.0
         self.turn_right_speed = 0.0
-
         self.spin_start_time = 0
-
-        self.backtrack_target = None  # next node to move toward while backtracking
+        self.backtrack_target = None
 
         # ---- DASHED LINE HANDLING ----
-        self.dashed_countdown = 0  # frames to keep driving straight during a dashed gap
+        self.dashed_countdown = 0
 
         # ---- MOTOR OUTPUT SANITIZATION ----
-        # Below this duty cycle the motors can't overcome friction and just
-        # stall/buzz instead of turning, so any nonzero speed gets floored to it.
         self.MIN_MOTOR_SPEED = 0.15
         self.MAX_MOTOR_SPEED = 1.0
 
         # ---- RECOVERY (spin search for a lost line) ----
-        # Give up spinning after this long without finding the line again
-        # (instead of spinning forever), but keep re-checking every frame.
         self.LINE_LOST_STOP_TIMEOUT_S = 4.0
         self.recovery_start_time = None
+
+        # ---- RED LINE STOP ----
+        self.RED_STOP_TIMEOUT_S = 2.0
+        self._red_stop_until = 0.0
 
         # ---- APPROACH (wide-ROI reacquire, far/curved line) ----
         self.APPROACH_SPEED = 0.4 * self.base_speed
 
-        # ---- SPEED RAMPING (slew-rate limited forward speed) ----
+        # ---- SPEED RAMPING ----
         self.SLEW_RATE_PER_S = 0.3
         self.applied_forward = 0.0
         self._dt = 0.0
@@ -90,14 +83,69 @@ class ControlAgent:
         self.CENTER_DEADZONE = 0.12
         self.SHARP_TURN_SPEED = 0.6
         self.TURN_LIMIT = 0.8
+        # Second, tighter authority cap applied at the wheel-mixing stage
+        # (_apply_steering), separate from TURN_LIMIT above which only
+        # bounds the intermediate PID/blend math. Dana/test_PID_camera.py
+        # uses this same two-stage design (its own TURN_LIMIT=0.80 +
+        # MAX_TURN_SPEED=0.40) specifically because, combined with symmetric
+        # reverse-capable steering, letting the full TURN_LIMIT reach the
+        # motors turns any moderate line error into a near-full pivot —
+        # forward and turn both push each wheel toward its opposite extreme,
+        # so the robot whips side to side instead of tracking the line.
+        self.MAX_TURN_SPEED = 0.4
         self.MAX_ERROR_PX = float(self.target_x)
 
-        # ---- SELF-TUNING PID (relay / Ziegler-Nichols auto-tune) ----
-        self.RELAY_AMPLITUDE = 0.35        # turn magnitude used to force oscillation
-        self.AUTOTUNE_BASE_SPEED = 0.5 * self.base_speed
-        self.AUTOTUNE_CYCLES = 4           # full oscillation cycles to average over
-        self.AUTOTUNE_TIMEOUT_S = 20.0     # give up and keep old gains if it won't oscillate
+        # Dana's hardware testing (Dana/test_PID_camera.py) found the REAL
+        # robot's motors turn opposite to the naive "turn>0 -> right slower"
+        # model and added a STEER_INVERT flag to compensate. That correction
+        # is real-hardware-specific: simulation.py's PyBullet joints have no
+        # such quirk (left/right wheel velocities map straight to physical
+        # turn direction), so inverting there makes every correction fire
+        # backwards — the robot steers away from the line instead of toward
+        # it. main.py (real hardware) should keep the default True;
+        # simulation.py must pass steer_invert=False.
+        self.STEER_INVERT = steer_invert
 
+        # ---- SPECIAL-STATE MEMORY (intersection/dead-end persistence) ----
+        # A single frame where vision sees nothing (glare, motion blur, a
+        # brief occlusion) shouldn't make the robot act like an intersection
+        # or dead-end it just detected never happened. Held briefly so a
+        # blank frame doesn't erase it, but cleared as soon as it's acted on.
+        self.SPECIAL_STATE_HOLD_S = 0.35
+        self._held_special_state = None
+        self._held_dead_end = False
+        self._held_until = 0.0
+
+        # ---- SPEED PROFILING (fast on straights, slow before turns) ----
+        self.CURVE_NORM_MAX = math.radians(60)
+        self.CURVE_SLOWDOWN_GAIN = 0.5
+        self.ERROR_SLOWDOWN_GAIN = 0.35
+        # Extra slowdown tied directly to how hard _pid_follow is currently
+        # steering (the same deadzone-"excess" ratio that blends turn toward
+        # SHARP_TURN_SPEED) — Dana's hardware testing found forward speed
+        # itself needs to collapse toward the sharp-turn response, not just
+        # the differential wheel split, or hard turns understeer.
+        self.SHARP_TURN_SLOWDOWN_GAIN = 0.6
+        self.APPROACH_SLOWDOWN_FACTOR = 0.55
+        self.STRAIGHT_BOOST_FACTOR = 1.3
+        self.MIN_SPEED_SCALE = 0.15
+        self.MAX_SPEED_SCALE = 1.3
+
+        # ---- TRUE PIVOT TURNING (reverse-capable) ----
+        # Fractions of base_speed used for in-place pivots (one wheel
+        # forward, one wheel reverse) instead of a forward-only differential
+        # — merged from Dana/test_PID_camera.py, which relies on real
+        # reverse output for its SPIN_SEARCH state and (via its symmetric
+        # forward+/-turn mix) for any sharp turn where turn exceeds forward.
+        self.TURN_PIVOT_SPEED = 0.6
+        self.SPIN_PIVOT_SPEED = 0.5
+        self.RECOVERY_PIVOT_SPEED = 0.45
+
+        # ---- SELF-TUNING PID ----
+        self.RELAY_AMPLITUDE = 0.35
+        self.AUTOTUNE_BASE_SPEED = 0.5 * self.base_speed
+        self.AUTOTUNE_CYCLES = 4
+        self.AUTOTUNE_TIMEOUT_S = 20.0
         self.autotune_start_time = 0.0
         self.autotune_last_sign = 0
         self.autotune_half_cycle_peak = 0.0
@@ -169,14 +217,18 @@ class ControlAgent:
     def _sanitize_speeds(self, left, right):
         """Clamp motor outputs to a valid, physically meaningful range.
 
-        Negative/over-range values from PID math are clamped to
-        [0.0, MAX_MOTOR_SPEED], and any nonzero speed below MIN_MOTOR_SPEED
-        is floored to it so the motors don't stall below their deadband.
+        Values are clamped to [-MAX_MOTOR_SPEED, MAX_MOTOR_SPEED] — negative
+        values are real reverse output (hardware.py's _set_motor already
+        supports it), needed for true in-place pivots on sharp turns and
+        spins, matching Dana/test_PID_camera.py's hardware-validated
+        reverse-capable steering. Any nonzero magnitude below MIN_MOTOR_SPEED
+        is floored to it (sign preserved) so the motors don't stall below
+        their deadband.
         """
         def clean(speed):
-            speed = max(0.0, min(self.MAX_MOTOR_SPEED, speed))
-            if 0.0 < speed < self.MIN_MOTOR_SPEED:
-                speed = self.MIN_MOTOR_SPEED
+            speed = max(-self.MAX_MOTOR_SPEED, min(self.MAX_MOTOR_SPEED, speed))
+            if 0.0 < abs(speed) < self.MIN_MOTOR_SPEED:
+                speed = self.MIN_MOTOR_SPEED if speed > 0 else -self.MIN_MOTOR_SPEED
             return speed
 
         return clean(left), clean(right)
@@ -197,7 +249,7 @@ class ControlAgent:
             return self._handle_autotune(vision_data, current_time)
 
         if self.state == "TURNING":
-            return self._handle_turn(current_time)
+            return self._handle_turn(vision_data, current_time)
 
         if self.state == "SPINNING":
             return self._handle_spin(current_time)
@@ -208,12 +260,32 @@ class ControlAgent:
         if self.state == "RECOVERING":
             return self._handle_recovery(vision_data, current_time)
 
+        if self.state == "RED_STOP":
+            if current_time < self._red_stop_until:
+                return 0.0, 0.0
+            self.state = "FOLLOWING"
+            self.applied_forward = 0.0
+
         # ---- FOLLOWING ----
         cx = vision_data.get("line_center_x")
         cy = vision_data.get("line_center_y")
         line_ended = vision_data.get("line_ended", False)
         is_dashed = vision_data.get("is_dashed", False)
         special = vision_data.get("special_state")
+        curvature = vision_data.get("line_curvature", 0.0)
+
+        # --- Special-state memory: a single blank frame (glare, motion blur,
+        # brief occlusion) right after seeing an intersection/dead-end
+        # shouldn't make the robot act like it never happened. Only kicks in
+        # when vision is truly blank this frame — a fresh, resolved line
+        # detection always wins over a stale hold. ---
+        if special in ("intersection", "dead_end"):
+            self._held_special_state = special
+            self._held_dead_end = line_ended
+            self._held_until = current_time + self.SPECIAL_STATE_HOLD_S
+        elif cx is None and special is None and current_time < self._held_until:
+            special = self._held_special_state
+            line_ended = self._held_dead_end
 
         # --- Dashed line: keep driving straight for a few frames ---
         if is_dashed and self.dashed_countdown <= 0:
@@ -223,9 +295,17 @@ class ControlAgent:
             self.dashed_countdown -= 1
             # Continue straight regardless of line data
             if cx is not None:
-                return self._pid_follow(cx)
+                return self._pid_follow(cx, curvature, special)
             forward = self._slew_forward(self.base_speed)
             return forward, forward  # straight
+
+        # --- Red line: stop motors for RED_STOP_TIMEOUT_S ---
+        if special == "red_line" or vision_data.get("red_line_detected"):
+            self.state = "RED_STOP"
+            self._red_stop_until = current_time + self.RED_STOP_TIMEOUT_S
+            self._held_until = 0.0
+            print(f"[Control] Red line stop — {self.RED_STOP_TIMEOUT_S}s hold")
+            return 0.0, 0.0
 
         # --- Wide-ROI reacquire: line is far/curved but still visible ---
         if special == "approach" and cx is not None:
@@ -234,6 +314,7 @@ class ControlAgent:
 
         # --- Line ended (dead end) ---
         if line_ended and special == "dead_end":
+            self._held_until = 0.0
             node = self._current_node()
             node.visited = True
             # Mark forward as explored (it's a dead end)
@@ -244,6 +325,7 @@ class ControlAgent:
 
         # --- Intersection detected ---
         if special == "intersection":
+            self._held_until = 0.0
             node = self._current_node()
             if not node.visited:
                 node.visited = True
@@ -266,16 +348,71 @@ class ControlAgent:
         # --- Normal PID line following ---
         if cx is not None:
             self.state = "FOLLOWING"
-            return self._pid_follow(cx)
+            return self._pid_follow(cx, curvature, special)
 
         # No line and not a dead end — recovery spin
         self._enter_recovery(current_time)
         return self._handle_recovery(vision_data, current_time)
 
     # ------------------------------------------------------------------
+    # Steering output (shared by all states so STEER_INVERT only lives here)
+    # ------------------------------------------------------------------
+    def _apply_steering(self, forward, turn):
+        """Convert a forward speed + signed turn command into left/right
+        wheel speeds using symmetric tank-steering (left=forward+turn,
+        right=forward-turn) — both wheels move, roughly double the turning
+        authority of a forward-only differential, and the inner wheel goes
+        negative (true reverse pivot) once turn exceeds forward on a sharp
+        turn. Matches Dana/test_PID_camera.py's hardware-validated mix.
+        turn>0 means "steer right" in the un-inverted convention (right
+        wheel slows/reverses). STEER_INVERT flips that mapping to match what
+        Dana's hardware testing found the real motors do.
+
+        `turn` is re-clamped to MAX_TURN_SPEED here — tighter than the
+        TURN_LIMIT already applied upstream — so this single mixing point is
+        the actual final authority cap for every caller, not just PID
+        follow's blend logic."""
+        if self.STEER_INVERT:
+            turn = -turn
+        turn = max(-self.MAX_TURN_SPEED, min(self.MAX_TURN_SPEED, turn))
+        left = forward + turn
+        right = forward - turn
+        return left, right
+
+    def _compute_speed_scale(self, curvature, norm_error, special_state):
+        """Scale base_speed up on flat, straight sections and down before a
+        curve or intersection, using the snake tracker's lookahead curvature
+        (vision.py) and its early "approaching_intersection" warning — so
+        the robot starts slowing before it reaches the turn, not once it's
+        already on top of it.
+
+        Also discounts by the same deadzone-"excess" ratio _pid_follow uses
+        to blend turn toward SHARP_TURN_SPEED, so the forward speed itself
+        collapses on a genuinely sharp turn rather than only the raw
+        error-magnitude term above — Dana's hardware-validated design ties
+        these together (its target_forward shrinks with the same blend that
+        drives target_turn toward its sharp-turn value)."""
+        curve_norm = max(0.0, min(1.0, curvature / self.CURVE_NORM_MAX)) if self.CURVE_NORM_MAX else 0.0
+        error_norm = min(1.0, abs(norm_error))
+        excess = (error_norm - self.CENTER_DEADZONE) / (1.0 - self.CENTER_DEADZONE) if self.CENTER_DEADZONE < 1.0 else 0.0
+        excess = max(0.0, min(1.0, excess))
+
+        scale = (1.0 - self.CURVE_SLOWDOWN_GAIN * curve_norm
+                 - self.ERROR_SLOWDOWN_GAIN * error_norm
+                 - self.SHARP_TURN_SLOWDOWN_GAIN * excess)
+
+        if special_state == "approaching_intersection":
+            scale *= self.APPROACH_SLOWDOWN_FACTOR
+
+        if special_state is None and curve_norm < 0.05 and error_norm < 0.05:
+            scale = max(scale, self.STRAIGHT_BOOST_FACTOR)
+
+        return max(self.MIN_SPEED_SCALE, min(self.MAX_SPEED_SCALE, scale))
+
+    # ------------------------------------------------------------------
     # PID line following
     # ------------------------------------------------------------------
-    def _pid_follow(self, cx):
+    def _pid_follow(self, cx, curvature=0.0, special_state=None):
         error = cx - self.target_x
         self.last_known_error = error
         norm_error = error / self.MAX_ERROR_PX if self.MAX_ERROR_PX else 0.0
@@ -304,15 +441,10 @@ class ControlAgent:
 
         turn = max(-self.TURN_LIMIT, min(self.TURN_LIMIT, turn))
 
-        forward = self._slew_forward(self.base_speed)
-        left = forward
-        right = forward
-        if turn > 0:
-            right -= turn
-        else:
-            left += turn
+        speed_scale = self._compute_speed_scale(curvature, norm_error, special_state)
+        forward = self._slew_forward(self.base_speed * speed_scale)
 
-        return left, right
+        return self._apply_steering(forward, turn)
 
     # ------------------------------------------------------------------
     # Approach (wide-ROI reacquire — line far away or around a curve)
@@ -328,14 +460,7 @@ class ControlAgent:
         turn = max(-self.TURN_LIMIT, min(self.TURN_LIMIT, turn))
 
         forward = self._slew_forward(self.APPROACH_SPEED)
-        left = forward
-        right = forward
-        if turn > 0:
-            right -= turn
-        else:
-            left += turn
-
-        return left, right
+        return self._apply_steering(forward, turn)
 
     # ------------------------------------------------------------------
     # Speed ramping
@@ -353,37 +478,55 @@ class ControlAgent:
     # ------------------------------------------------------------------
     # Turn handling (intersection turns)
     # ------------------------------------------------------------------
+    def _turn_speeds_for_direction(self, direction):
+        """Un-inverted convention: turning left means the left wheel reverses
+        and the right wheel drives forward — a true in-place pivot instead of
+        a forward-only differential, matching Dana's reverse-capable
+        hardware testing. STEER_INVERT swaps which physical side that maps
+        to, same as it does for PID steering — kept as one flag so turn
+        direction and line-following steering can never disagree."""
+        if direction == "forward":
+            return self.base_speed, self.base_speed
+
+        pivot = self.TURN_PIVOT_SPEED * self.base_speed
+        if direction == "left":
+            left_speed, right_speed = -pivot, pivot
+        else:  # right
+            left_speed, right_speed = pivot, -pivot
+
+        if self.STEER_INVERT:
+            left_speed, right_speed = right_speed, left_speed
+        return left_speed, right_speed
+
     def _start_turn(self, direction, current_time):
         self.state = "TURNING"
+        self.turn_direction = direction
         self.turn_start_time = current_time
-        self.turn_duration = 0.7  # seconds for 90-degree turn
-        if direction == "left":
-            self.turn_left_speed = 0.2
-            self.turn_right_speed = 0.8
-        elif direction == "right":
-            self.turn_left_speed = 0.8
-            self.turn_right_speed = 0.2
-        else:  # forward — just drive straight through
-            self.turn_left_speed = self.base_speed
-            self.turn_right_speed = self.base_speed
-            self.turn_duration = 0.3
+        # A brief blind minimum so the robot actually clears the wide
+        # intersection line before checking vision again, then a generous
+        # cap as a fallback if the line is never reconfirmed.
+        self.turn_min_duration = 0.3 if direction == "forward" else 0.35
+        self.turn_max_duration = 0.3 if direction == "forward" else 1.4
+        self.turn_left_speed, self.turn_right_speed = self._turn_speeds_for_direction(direction)
 
-    def _handle_turn(self, current_time):
+    def _handle_turn(self, vision_data, current_time):
         elapsed = current_time - self.turn_start_time
-        if elapsed < self.turn_duration:
-            return self.turn_left_speed, self.turn_right_speed
-        else:
-            # Turn complete — advance grid and go back to following
-            direction = None
-            if self.turn_left_speed < self.turn_right_speed:
-                direction = "left"
-            elif self.turn_right_speed < self.turn_left_speed:
-                direction = "right"
-            else:
-                direction = "forward"
-            self._move_grid(direction)
-            self.state = "FOLLOWING"
-            return self.base_speed, self.base_speed
+        if elapsed >= self.turn_min_duration:
+            cx = vision_data.get("line_center_x")
+            special = vision_data.get("special_state")
+            # A line that's reappeared, roughly centered, and not still
+            # reading as an intersection means the turn has actually
+            # completed — don't wait out the full timer if it's not needed.
+            line_reacquired = (
+                cx is not None
+                and special in (None, "approach")
+                and abs(cx - self.target_x) < self.MAX_ERROR_PX * 0.35
+            )
+            if line_reacquired or elapsed >= self.turn_max_duration:
+                self._move_grid(self.turn_direction)
+                self.state = "FOLLOWING"
+                return self.base_speed, self.base_speed
+        return self.turn_left_speed, self.turn_right_speed
 
     # ------------------------------------------------------------------
     # Spin handling (dead end 180)
@@ -396,8 +539,12 @@ class ControlAgent:
         elapsed = current_time - self.spin_start_time
         spin_duration = 1.2  # time for 180-degree spin
         if elapsed < spin_duration:
-            # Spin in place: left backward, right forward (or vice versa)
-            return 0.2, 0.8
+            # True in-place pivot (left reverse, right forward), scaled by
+            # base_speed — direction is arbitrary for a 180 (heading update
+            # below is an unconditional +2 either way), so no STEER_INVERT
+            # swap is needed here, unlike the direction-sensitive turns.
+            pivot = self.SPIN_PIVOT_SPEED * self.base_speed
+            return -pivot, pivot
         else:
             # Spin complete — update heading and start backtracking
             self.heading = (self.heading + 2) % 4  # 180 degrees
@@ -462,7 +609,7 @@ class ControlAgent:
         # Follow the line toward the next backtrack node
         cx = vision_data.get("line_center_x")
         if cx is not None:
-            return self._pid_follow(cx)
+            return self._pid_follow(cx, vision_data.get("line_curvature", 0.0), vision_data.get("special_state"))
         return self.base_speed, self.base_speed
 
     # ------------------------------------------------------------------
@@ -495,10 +642,21 @@ class ControlAgent:
             # _calculate_speeds_raw re-enters this every frame regardless.
             return 0.0, 0.0
 
-        if self.last_known_error > 0:
-            return 0.6, 0.0
+        # Spin toward whichever side the line was last seen on. In the
+        # un-inverted convention a positive error (line to the right) means
+        # spin right (right wheel reverses, left wheel forward) — STEER_INVERT
+        # flips which physical side that is, same as everywhere else. True
+        # in-place pivot (both wheels driven, opposite signs) instead of one
+        # wheel idle, matching Dana's SPIN_SEARCH design.
+        spin_toward_positive_error = self.last_known_error > 0
+        if self.STEER_INVERT:
+            spin_toward_positive_error = not spin_toward_positive_error
+
+        pivot = self.RECOVERY_PIVOT_SPEED * self.base_speed
+        if spin_toward_positive_error:
+            return pivot, -pivot
         else:
-            return 0.0, 0.6
+            return -pivot, pivot
 
     # ------------------------------------------------------------------
     # Self-tuning PID (relay-based / Ziegler-Nichols auto-tune)
