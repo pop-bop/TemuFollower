@@ -76,8 +76,8 @@ class VisionAgent:
         self.WIDE_ROI_X_END_RATIO = 1.0
         self.MIN_LINE_AREA = 40
 
-        self.APPROACH_INTERSECTION_WIDTH_RATIO = 0.5
-        self.INTERSECTION_WIDTH_RATIO = 0.8
+        self.APPROACH_INTERSECTION_WIDTH_RATIO = 0.18
+        self.INTERSECTION_WIDTH_RATIO = 0.30
 
         self.MARKER_GREEN_LOWER = (35, 80, 70)
         self.MARKER_GREEN_UPPER = (90, 255, 255)

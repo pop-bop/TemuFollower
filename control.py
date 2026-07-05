@@ -1,30 +1,12 @@
 import time
 import math
 import random
-from collections import deque
-
-class MazeNode:
-    """Represents a cell in the maze grid."""
-    def __init__(self, x, y):
-        self.x = x
-        self.y = y
-        self.visited = False
-        self.explored_dirs = set()  # dirs we already tried from here: "left", "right", "forward"
-        self.parent = None           # for backtracking path
-
-    def __hash__(self):
-        return hash((self.x, self.y))
-
-    def __eq__(self, other):
-        return isinstance(other, MazeNode) and self.x == other.x and self.y == other.y
 
 
 class ControlAgent:
     def __init__(self, target_x_center=160, base_speed=1.0, reactive_only=False, steer_invert=True):
         self.target_x = target_x_center
         self.base_speed = base_speed
-        self.reactive_only = reactive_only  # If True, only PID follow — no maze memory
-
         # PID constants
         self.Kp = 0.003
         self.Ki = 0.0001
@@ -35,16 +17,11 @@ class ControlAgent:
         self.last_error = 0
         self.last_time = time.time()
 
-        # ---- MAZE SOLVING STATE (disabled in reactive_only mode) ----
-        self.grid_x = 0
-        self.grid_y = 0
+        # ---- SIMPLE INTERSECTION MEMORY (no maze solver) ----
+        self.visited_cells = set()
+        self.current_cell = (0, 0)
         self.heading = 0
-        self.nodes = {}
-        if not self.reactive_only:
-            self._get_or_create_node(0, 0)
 
-        self.explore_stack = []
-        self.backtrack_path = deque()
         self.state = "FOLLOWING"
         self.last_known_error = 0
         self.turn_start_time = 0
@@ -54,7 +31,6 @@ class ControlAgent:
         self.turn_left_speed = 0.0
         self.turn_right_speed = 0.0
         self.spin_start_time = 0
-        self.backtrack_target = None
 
         # ---- DASHED LINE HANDLING ----
         self.dashed_countdown = 0
@@ -155,57 +131,30 @@ class ControlAgent:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
-    def _get_or_create_node(self, gx, gy):
-        key = (gx, gy)
-        if key not in self.nodes:
-            self.nodes[key] = MazeNode(gx, gy)
-        return self.nodes[key]
-
-    def _current_node(self):
-        return self._get_or_create_node(self.grid_x, self.grid_y)
-
     def _move_grid(self, direction):
-        """Advance grid coords one step in the given direction (relative to current heading)."""
+        """Advance current_cell one step in the given direction (relative to current heading),
+        then update heading to reflect the new orientation after the turn."""
         actual = (self.heading + {"forward": 0, "right": 1, "backward": 2, "left": 3}[direction]) % 4
         dx = [0, 1, 0, -1][actual]
         dy = [1, 0, -1, 0][actual]
-        self.grid_x += dx
-        self.grid_y += dy
+        cx, cy = self.current_cell
+        self.current_cell = (cx + dx, cy + dy)
+        self.heading = actual
 
-    def _dir_from_vision_error(self, error):
-        """Map PID error to a direction name."""
-        if error < -30:
-            return "left"
-        elif error > 30:
-            return "right"
-        else:
-            return "forward"
-
-    def _direction_leads_to_visited(self, node, direction):
-        """Whether taking `direction` from `node` (given current heading) walks
-        straight back onto a node we've already visited."""
-        actual = (self.heading + {"forward": 0, "right": 1, "backward": 2, "left": 3}[direction]) % 4
+    def _cell_in_direction(self, direction):
+        """Return the (x, y) cell one step in `direction` from current cell."""
+        actual = (self.heading + {"forward": 0, "right": 1, "left": 3}[direction]) % 4
         dx = [0, 1, 0, -1][actual]
         dy = [1, 0, -1, 0][actual]
-        neighbor = self.nodes.get((node.x + dx, node.y + dy))
-        return neighbor is not None and neighbor.visited
+        cx, cy = self.current_cell
+        return (cx + dx, cy + dy)
 
-    def _pick_unexplored_direction(self, node):
-        """Return a direction string not yet explored from this node, or None.
-
-        Prefers a direction that leads into unvisited territory — the robot
-        shouldn't want to re-tread ground it's already covered. Only falls
-        back to a direction that leads to a visited node if every unexplored
-        option does (e.g. a loop back to an earlier intersection).
-        """
-        candidates = ["left", "right", "forward"]
+    def _pick_turn_direction(self):
+        """Pick a direction to turn, preferring unvisited cells."""
+        candidates = ["forward", "left", "right"]
         random.shuffle(candidates)
-        unexplored = [d for d in candidates if d not in node.explored_dirs]
-        if not unexplored:
-            return None
-
-        fresh = [d for d in unexplored if not self._direction_leads_to_visited(node, d)]
-        return fresh[0] if fresh else unexplored[0]
+        unvisited = [d for d in candidates if self._cell_in_direction(d) not in self.visited_cells]
+        return unvisited[0] if unvisited else candidates[0]
 
     # ------------------------------------------------------------------
     # main entry
@@ -253,9 +202,6 @@ class ControlAgent:
 
         if self.state == "SPINNING":
             return self._handle_spin(current_time)
-
-        if self.state == "BACKTRACKING":
-            return self._handle_backtrack(vision_data, current_time)
 
         if self.state == "RECOVERING":
             return self._handle_recovery(vision_data, current_time)
@@ -315,35 +261,20 @@ class ControlAgent:
         # --- Line ended (dead end) ---
         if line_ended and special == "dead_end":
             self._held_until = 0.0
-            node = self._current_node()
-            node.visited = True
-            # Mark forward as explored (it's a dead end)
-            node.explored_dirs.add("forward")
-            print(f"[Maze] Dead end at ({self.grid_x},{self.grid_y}). Initiating 180 + backtrack.")
+            self.visited_cells.add(self.current_cell)
+            print(f"[Control] Dead end at {self.current_cell}. Spinning 180.")
             self._start_spin(current_time)
-            return 0.0, 0.0  # will be overridden next frame
+            return 0.0, 0.0
 
         # --- Intersection detected ---
         if special == "intersection":
             self._held_until = 0.0
-            node = self._current_node()
-            if not node.visited:
-                node.visited = True
-                print(f"[Maze] Intersection at ({self.grid_x},{self.grid_y}). "
-                      f"Explored so far: {node.explored_dirs}")
-            # Try unexplored direction
-            unexplored = self._pick_unexplored_direction(node)
-            if unexplored is not None:
-                node.explored_dirs.add(unexplored)
-                print(f"[Maze] Turning {unexplored.upper()} at ({self.grid_x},{self.grid_y})")
-                self._start_turn(unexplored, current_time)
-                return 0.0, 0.0
-            else:
-                # All directions explored — backtrack
-                print(f"[Maze] All explored at ({self.grid_x},{self.grid_y}). Backtracking.")
-                self.state = "BACKTRACKING"
-                self._setup_backtrack()
-                return 0.0, 0.0
+            self.visited_cells.add(self.current_cell)
+            direction = self._pick_turn_direction()
+            print(f"[Control] Intersection at {self.current_cell}. Turning {direction.upper()} "
+                  f"(visited={len(self.visited_cells)})")
+            self._start_turn(direction, current_time)
+            return 0.0, 0.0
 
         # --- Normal PID line following ---
         if cx is not None:
@@ -539,78 +470,13 @@ class ControlAgent:
         elapsed = current_time - self.spin_start_time
         spin_duration = 1.2  # time for 180-degree spin
         if elapsed < spin_duration:
-            # True in-place pivot (left reverse, right forward), scaled by
-            # base_speed — direction is arbitrary for a 180 (heading update
-            # below is an unconditional +2 either way), so no STEER_INVERT
-            # swap is needed here, unlike the direction-sensitive turns.
             pivot = self.SPIN_PIVOT_SPEED * self.base_speed
             return -pivot, pivot
         else:
-            # Spin complete — update heading and start backtracking
-            self.heading = (self.heading + 2) % 4  # 180 degrees
-            self.state = "BACKTRACKING"
-            self._setup_backtrack()
-            return self.base_speed, self.base_speed
-
-    # ------------------------------------------------------------------
-    # Backtracking (return to last intersection, try other route)
-    # ------------------------------------------------------------------
-    def _setup_backtrack(self):
-        """
-        Build a path from current node back to the nearest unvisited intersection
-        using parent pointers (BFS from current node, or walk back through stack).
-        """
-        start = self._current_node()
-
-        # BFS to find nearest node that still has unexplored directions
-        visited_bfs = set()
-        queue = deque()
-        queue.append((start, []))
-        visited_bfs.add((start.x, start.y))
-
-        while queue:
-            node, path = queue.popleft()
-            unexplored = self._pick_unexplored_direction(node)
-            if unexplored is not None and len(path) > 0:
-                # Found a node with unexplored directions — backtrack to it
-                self.backtrack_path = deque(path)
-                self.backtrack_target = node
-                print(f"[Maze] Backtracking to ({node.x},{node.y}) — {len(path)} steps away")
-                return
-
-            # Explore neighbors (forward, left, right relative to the grid)
-            for dx, dy, dname in [(0, 1, "forward"), (1, 0, "right"), (0, -1, "backward"), (-1, 0, "left")]:
-                nx, ny = node.x + dx, node.y + dy
-                if (nx, ny) not in visited_bfs and (nx, ny) in self.nodes:
-                    visited_bfs.add((nx, ny))
-                    neighbor = self.nodes[(nx, ny)]
-                    new_path = path + [(neighbor, dname)]
-                    queue.append((neighbor, new_path))
-
-        # No unexplored intersections found — maze fully explored, stop
-        print("[Maze] All intersections fully explored! Maze solved. Stopping.")
-        self.state = "STOPPED"
-
-    def _handle_backtrack(self, vision_data, current_time):
-        """Drive straight / PID follow while navigating back along the backtrack path."""
-        if not self.backtrack_path:
-            # Reached the target intersection — now pick an unexplored direction
-            if self.backtrack_target is not None:
-                node = self.backtrack_target
-                unexplored = self._pick_unexplored_direction(node)
-                if unexplored is not None:
-                    node.explored_dirs.add(unexplored)
-                    print(f"[Maze] Arrived at ({node.x},{node.y}). Turning {unexplored.upper()}")
-                    self._start_turn(unexplored, current_time)
-                    return 0.0, 0.0
+            self.heading = (self.heading + 2) % 4
             self.state = "FOLLOWING"
+            self.applied_forward = 0.0
             return self.base_speed, self.base_speed
-
-        # Follow the line toward the next backtrack node
-        cx = vision_data.get("line_center_x")
-        if cx is not None:
-            return self._pid_follow(cx, vision_data.get("line_curvature", 0.0), vision_data.get("special_state"))
-        return self.base_speed, self.base_speed
 
     # ------------------------------------------------------------------
     # Recovery (lost line, spinning to find it)
@@ -621,14 +487,9 @@ class ControlAgent:
         self.state = "RECOVERING"
 
     def _recovered_to_following(self):
-        """Line reacquired after being genuinely lost. Rather than blindly
-        continuing wherever the spin happened to point, head back to the
-        nearest intersection with unexplored options — the robot shouldn't
-        assume whatever's ahead is new ground just because it found a line."""
-        print("[Maze] Line reacquired after recovery — returning to nearest open intersection.")
+        print("[Control] Line reacquired after recovery.")
         self.applied_forward = 0.0
-        self.state = "BACKTRACKING"
-        self._setup_backtrack()
+        self.state = "FOLLOWING"
 
     def _handle_recovery(self, vision_data, current_time):
         cx = vision_data.get("line_center_x")
