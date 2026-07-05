@@ -13,7 +13,8 @@ from config import (
     MARKER_ACTION_DELAY_S,
     RED_LED_PIN, GREEN_LED_PIN,
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
-    INTERSECTION_COOLDOWN_S, MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO,
+    INTERSECTION_COOLDOWN_S, INTERSECTION_MEMORY_MAX_AGE_S,
+    MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO, ROTATE_SETTLE_TIME_S,
 )
 from camera import open_camera, read_frame
 from vision import (
@@ -67,7 +68,9 @@ def main():
     backtrack_intersection_wp = None
     backtrack_target_branch_idx = None
     backtrack_start_time = None
+    rotate_settle_until = None
     last_intersection_time = 0.0
+    dead_end_recorded = False
 
     print("PID line following running. Press Ctrl+C to stop.")
     print("Manual indicator test keys: r=toggle red LED, g=toggle green LED, b=buzzer blip")
@@ -92,16 +95,27 @@ def main():
                     pending_marker_color = None
                     pending_marker_action_time = None
                     backtrack_intersection_wp = None
+                    backtrack_target_branch_idx = None
+                    backtrack_start_time = None
+                    rotate_settle_until = None
+                    dead_end_recorded = False
                     stop_motors(left_pwm, right_pwm)
                 elif key in (13, 10):
                     if mode != "AUTO":
                         print("SWITCHED TO AUTO: resuming line following")
                     mode = "AUTO"
+                    state = "FOLLOW"
                     applied_forward = 0.0
+                    integral = 0.0
+                    last_error = 0.0
                     pending_marker_color = None
                     pending_marker_action_time = None
                     backtrack_intersection_wp = None
+                    backtrack_target_branch_idx = None
                     backtrack_start_time = None
+                    rotate_settle_until = None
+                    dead_end_recorded = False
+                    spin_start_time = None
                     stop_motors(left_pwm, right_pwm)
                     if halted:
                         print("MANUAL OVERRIDE: clearing red-marker halt")
@@ -186,11 +200,13 @@ def main():
             active_debug = normal_debug
 
             # INTERSECTION DETECTION (only when centered on the line)
-            if normal_error is not None and abs(normal_error) < CENTER_DEADZONE * 2:
+            if (state not in ("BACKTRACK", "ROTATE")
+                    and normal_error is not None
+                    and abs(normal_error) < CENTER_DEADZONE * 2):
                 if now - last_intersection_time > INTERSECTION_COOLDOWN_S:
                     intersection = detect_intersection_normal(frame)
                     if intersection:
-                        buffer.record(
+                        inter_wp = buffer.record(
                             frame=frame, state=state, error=normal_error,
                             is_intersection=True,
                             branches=intersection["branches"],
@@ -198,7 +214,7 @@ def main():
                         )
                         last_intersection_time = now
                         print(f"INTERSECTION: {intersection['branch_count']} branches, "
-                              f"chosen idx {intersection['chosen_branch_idx']}")
+                              f"chosen idx {inter_wp['chosen_branch_idx']}")
 
             # ----- BACKTRACK: reverse along the line to reach last intersection -----
             if state == "BACKTRACK":
@@ -210,6 +226,7 @@ def main():
                     print(f"BACKTRACK: reached intersection ({inter['branch_count']} branches)")
                     stop_motors(left_pwm, right_pwm)
                     backtrack_start_time = None
+                    rotate_settle_until = now + ROTATE_SETTLE_TIME_S
                     state = "ROTATE"
                     continue
 
@@ -241,34 +258,62 @@ def main():
 
             # ----- ROTATE: turn toward the untried branch at the intersection -----
             elif state == "ROTATE":
-                inter = detect_intersection_normal(frame)
-                if inter and backtrack_target_branch_idx is not None and backtrack_target_branch_idx < len(inter["branches"]):
-                    target_branch = inter["branches"][backtrack_target_branch_idx]
-                    roi_w = frame.shape[1] * (ROI_X_END_RATIO - ROI_X_START_RATIO)
-                    branch_error = (target_branch["cx"] - inter["roi_center_x"]) / max(1.0, roi_w / 2.0)
+                if rotate_settle_until is not None and now < rotate_settle_until:
+                    target_forward = 0.0
+                    target_turn = 0.0
+                    display_turn = 0.0
+                    active_debug = normal_debug
+                    prev_green_marker = False
+                    prev_red_marker = False
+                else:
+                    rotate_settle_until = None
 
-                    if abs(branch_error) < CENTER_DEADZONE * 0.5:
-                        print("ROTATE: branch centered, switching to FOLLOW")
-                        buffer.mark_branch_taken(backtrack_intersection_wp, backtrack_target_branch_idx)
-                        buffer.clear_after(backtrack_intersection_wp["timestamp"])
+                    if backtrack_start_time is None:
+                        backtrack_start_time = now
+                    rotate_elapsed = now - backtrack_start_time
+                    if rotate_elapsed > BACKTRACK_SEARCH_TIMEOUT_S:
+                        print("ROTATE TIMEOUT: giving up")
                         backtrack_intersection_wp = None
                         backtrack_target_branch_idx = None
-                        integral = 0.0
-                        last_error = 0.0
-                        search_direction = 1.0
-                        state = "FOLLOW"
+                        backtrack_start_time = None
+                        rotate_settle_until = None
+                        state = "STOP"
                     else:
-                        turn = clamp(branch_error * ROTATE_SPEED * 2, -ROTATE_SPEED, ROTATE_SPEED)
-                        target_forward = 0.0
-                        target_turn = turn
-                        display_turn = turn
-                else:
-                    target_forward = 0.0
-                    target_turn = ROTATE_SPEED * 0.5
+                        inter = detect_intersection_normal(frame)
+                        if inter and backtrack_target_branch_idx is not None and backtrack_target_branch_idx < len(inter["branches"]):
+                            target_branch = inter["branches"][backtrack_target_branch_idx]
+                            roi_w = frame.shape[1] * (ROI_X_END_RATIO - ROI_X_START_RATIO)
+                            branch_error = (target_branch["cx"] - inter["roi_center_x"]) / max(1.0, roi_w / 2.0)
+
+                            if abs(branch_error) < CENTER_DEADZONE * 0.5:
+                                print("ROTATE: branch centered, switching to FOLLOW")
+                                if backtrack_intersection_wp is not None:
+                                    buffer.mark_branch_taken(backtrack_intersection_wp, backtrack_target_branch_idx)
+                                    buffer.clear_after(backtrack_intersection_wp["timestamp"])
+                                backtrack_intersection_wp = None
+                                backtrack_target_branch_idx = None
+                                backtrack_start_time = None
+                                rotate_settle_until = None
+                                dead_end_recorded = False
+                                integral = 0.0
+                                last_error = 0.0
+                                search_direction = 1.0
+                                state = "FOLLOW"
+                            else:
+                                turn = clamp(branch_error * ROTATE_SPEED * 2, -ROTATE_SPEED, ROTATE_SPEED)
+                                if STEER_INVERT:
+                                    turn = -turn
+                                target_forward = 0.0
+                                target_turn = turn
+                                display_turn = turn
+                        else:
+                            target_forward = 0.0
+                            target_turn = ROTATE_SPEED * 0.5 if not STEER_INVERT else -ROTATE_SPEED * 0.5
 
             # ----- NORMAL LINE FOLLOWING -----
             elif normal_error is not None:
                 state = "FOLLOW"
+                dead_end_recorded = False
                 error = normal_error
                 integral += error * dt
                 derivative = (error - last_error) / dt
@@ -319,6 +364,7 @@ def main():
 
                 if wide_error is not None:
                     state = "APPROACH"
+                    dead_end_recorded = False
                     active_debug = wide_debug
                     raw_turn = clamp(KP * wide_error, -TURN_LIMIT, TURN_LIMIT)
                     display_turn = raw_turn
@@ -340,15 +386,23 @@ def main():
                         target_turn = -SPIN_SEARCH_SPEED * search_direction
                     else:
                         # Dead end: try backtracking if we have intersection history
+                        if not dead_end_recorded:
+                            buffer.record_dead_end(frame=frame, state=state)
+                            dead_end_recorded = True
+
                         if backtrack_intersection_wp is None:
-                            inter_wp = buffer.find_recent_intersection(now)
+                            inter_wp = buffer.find_recent_intersection(
+                                now, max_age=INTERSECTION_MEMORY_MAX_AGE_S,
+                            )
                             if inter_wp and buffer.has_untried_branches(inter_wp):
                                 branch_idx, branch = buffer.find_untried_branch(inter_wp)
                                 if branch is not None:
-                                    print("DEAD END: backtracking to intersection")
+                                    print("DEAD END: backtracking to last intersection "
+                                          f"and trying branch {branch_idx}")
                                     backtrack_intersection_wp = inter_wp
                                     backtrack_target_branch_idx = branch_idx
                                     backtrack_start_time = now
+                                    rotate_settle_until = None
                                     buffer.mark_chosen_branch_taken(inter_wp)
                                     state = "BACKTRACK"
                                     target_forward = 0.0
@@ -357,6 +411,8 @@ def main():
                                     target_forward = 0.0
                                     target_turn = 0.0
                             else:
+                                print("DEAD END: no untried intersection branch found")
+                                state = "STOP"
                                 target_forward = 0.0
                                 target_turn = 0.0
                         else:

@@ -41,7 +41,7 @@ def update_led(led_state, pin, now):
     led_state["on"] = not led_state["on"]
     GPIO.output(pin, GPIO.HIGH if led_state["on"] else GPIO.LOW)
     led_state["next_toggle"] = now + led_state["interval"]
-    if led_state["blinks_left"] is not None:
+    if led_state["blinks_left"] is not None and not led_state["on"]:
         led_state["blinks_left"] -= 1
         if led_state["blinks_left"] <= 0:
             led_state["active"] = False

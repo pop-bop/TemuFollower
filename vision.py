@@ -5,7 +5,7 @@ from config import (
     ROI_Y_START_RATIO, ROI_Y_END_RATIO, ROI_X_START_RATIO, ROI_X_END_RATIO,
     WIDE_ROI_Y_START_RATIO, WIDE_ROI_X_START_RATIO, WIDE_ROI_X_END_RATIO,
     BLACK_THRESHOLD, MIN_LINE_AREA, GREEN_DIFF_THRESHOLD, RED_DIFF_THRESHOLD,
-    MIN_MARKER_AREA, INTERSECTION_MIN_AREA,
+    MIN_MARKER_AREA, INTERSECTION_MIN_AREA, INTERSECTION_MIN_CONTOURS,
 )
 from utils import clamp
 
@@ -121,7 +121,7 @@ def detect_intersection(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     significant = [c for c in contours if cv2.contourArea(c) >= INTERSECTION_MIN_AREA]
 
-    if len(significant) < 2:
+    if len(significant) < INTERSECTION_MIN_CONTOURS:
         return None
 
     contour_info = []
