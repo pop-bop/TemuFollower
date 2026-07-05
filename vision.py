@@ -1,13 +1,11 @@
-import math
 import cv2
 import numpy as np
 
 
 # ------------------------------------------------------------------
 # VISION AGENT
-# Classic contour-based line following with edge-width validation
-# (10-12 px between line edges) and red-line stop detection.
-# Integrates Dana's improved line classification for the mask.
+# Dana's line detection (simple threshold + morph + largest contour),
+# with intersection detection and red-line stop layered on top.
 # ------------------------------------------------------------------
 class VisionAgent:
     def __init__(self, resolution=(320, 240), fps=30, open_camera=True):
@@ -62,22 +60,9 @@ class VisionAgent:
         self._init_constants()
 
     def _init_constants(self):
-        # ---- LINE TRACKING CONSTANTS ----
-        self.LINE_WIDTH_MIN = 5
-        self.LINE_WIDTH_MAX = 20
-
-        # ---- ZERO SCAN (Baeyens derivative scanline) ----
-        self.SCAN_HEIGHT_RATIO = 0.92
-        self.SCAN_RADIUS = 140
-
-        # ---- DANA LINE CLASSIFICATION ----
-        self.WIDE_ROI_Y_START_RATIO = 0.20
-        self.WIDE_ROI_X_START_RATIO = 0.0
-        self.WIDE_ROI_X_END_RATIO = 1.0
-        self.MIN_LINE_AREA = 40
-
-        self.APPROACH_INTERSECTION_WIDTH_RATIO = 0.18
-        self.INTERSECTION_WIDTH_RATIO = 0.30
+        # ---- DANA LINE TRACKING CONSTANTS ----
+        self.BLACK_THRESHOLD = 82
+        self.MIN_LINE_AREA = 45
 
         self.MARKER_GREEN_LOWER = (35, 80, 70)
         self.MARKER_GREEN_UPPER = (90, 255, 255)
@@ -86,17 +71,19 @@ class VisionAgent:
         self.MARKER_RED_LOWER_2 = (165, 90, 80)
         self.MARKER_RED_UPPER_2 = (180, 255, 255)
 
-        self.BLACK_THRESHOLD = 82
-        self.STRICT_BLACK_THRESHOLD = 70
+        # ---- WIDE ROI (approach fallback) ----
+        self.WIDE_ROI_Y_START_RATIO = 0.20
+        self.WIDE_ROI_X_START_RATIO = 0.0
+        self.WIDE_ROI_X_END_RATIO = 1.0
+
+        # ---- INTERSECTION DETECTION ----
+        self.APPROACH_INTERSECTION_WIDTH_RATIO = 0.18
+        self.INTERSECTION_WIDTH_RATIO = 0.30
 
         # ---- RED LINE STOP ----
         self.RED_LINE_MIN_AREA = 60
         self.RED_LINE_STOP_FRAMES = 24
         self._red_stop_counter = 0
-
-        # Frame-to-frame smoothing for seed
-        self._seed_smoothing = 0.55
-        self._prev_seed = None
 
     # --------------------------------------------------------------
     # Camera I/O
@@ -184,22 +171,12 @@ class VisionAgent:
         self.camera_kind = None
 
     # --------------------------------------------------------------
-    # Dana-style improved line mask
+    # Dana's line detection: blur → threshold → exclude markers → morph
     # --------------------------------------------------------------
-    def _improve_line_mask(self, gray_roi, color_roi=None):
+    def _line_mask(self, gray_roi, color_roi=None):
+        """Dana's mask generation — single global threshold (no hybrid)."""
         blurred = cv2.GaussianBlur(gray_roi, (5, 5), 0)
-        _, mask_global = cv2.threshold(blurred, self.BLACK_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
-
-        mask_adaptive = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 21, 8
-        )
-
-        mask_color = np.zeros_like(gray_roi)
-        mask_color[gray_roi < self.STRICT_BLACK_THRESHOLD] = 255
-
-        mask_combined = cv2.bitwise_or(mask_global, mask_adaptive)
-        mask_combined = cv2.bitwise_or(mask_combined, mask_color)
+        _, mask = cv2.threshold(blurred, self.BLACK_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
 
         if color_roi is not None:
             hsv = cv2.cvtColor(color_roi, cv2.COLOR_BGR2HSV)
@@ -208,77 +185,32 @@ class VisionAgent:
                 cv2.inRange(hsv, np.array(self.MARKER_RED_LOWER_1), np.array(self.MARKER_RED_UPPER_1)),
                 cv2.inRange(hsv, np.array(self.MARKER_RED_LOWER_2), np.array(self.MARKER_RED_UPPER_2)),
             )
-            mask_combined[green_mask > 0] = 0
-            mask_combined[red_mask > 0] = 0
+            mask[green_mask > 0] = 0
+            mask[red_mask > 0] = 0
 
-        kernel_open = np.ones((3, 3), np.uint8)
-        mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_OPEN, kernel_open)
-        kernel_close = np.ones((9, 9), np.uint8)
-        mask_closed = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel_close)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        return mask
 
-        return mask_combined, mask_closed, mask_global, mask_adaptive, mask_color
-
-    def _locate_line_simple(self, gray_roi, color_roi=None):
-        mask_black, _, _, _, _ = self._improve_line_mask(gray_roi, color_roi)
-        contours, _ = cv2.findContours(mask_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def _dana_find_line(self, gray_roi, color_roi=None):
+        """Dana's line detection: mask → largest contour → centroid.
+        Returns ((cx_roi, cy_roi), mask) or (None, mask)."""
+        mask = self._line_mask(gray_roi, color_roi)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return None
+            return None, mask
+
         largest = max(contours, key=cv2.contourArea)
         if cv2.contourArea(largest) < self.MIN_LINE_AREA:
-            return None
+            return None, mask
+
         M = cv2.moments(largest)
-        if M["m00"] == 0:
-            return None
+        if M["m00"] <= 0:
+            return None, mask
+
         cx = int(M["m10"] / M["m00"])
         cy = int(M["m01"] / M["m00"])
-        return cx, cy
-
-    # --------------------------------------------------------------
-    # Zero-scan: Baeyens derivative scanline
-    # --------------------------------------------------------------
-    def _scanline_seed(self, gray, scan_y):
-        h, w = gray.shape
-        center_x = w // 2
-        radius = min(self.SCAN_RADIUS, center_x, w - 1 - center_x)
-        if radius < 2:
-            return None
-        scan_data = gray[scan_y, center_x - radius: center_x + radius].astype(np.float32)
-
-        der = np.zeros_like(scan_data)
-        der[1:-1] = scan_data[:-2] - scan_data[2:]
-
-        left_edge = int(np.argmax(der))
-        right_edge = int(np.argmin(der))
-        line_idx = (left_edge + right_edge) / 2.0
-
-        line_x = int(round(center_x - radius + line_idx))
-        line_x = max(0, min(w - 1, line_x))
-        return line_x, scan_y
-
-    # --------------------------------------------------------------
-    # Find line contour with width validation
-    # --------------------------------------------------------------
-    def _find_line_contour(self, mask_black):
-        """Return the largest contour above MIN_LINE_AREA (Dana style).
-        No width/geometry filtering — a curved line at a turn naturally
-        produces a valid contour whose area-weighted centroid is exactly
-        what the PID needs to steer toward it. Width ratio is checked
-        later in process_frame for intersection detection."""
-        contours, _ = cv2.findContours(mask_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return None
-
-        best = None
-        best_area = 0
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < self.MIN_LINE_AREA:
-                continue
-            if area > best_area:
-                best_area = area
-                best = c
-
-        return best
+        return (cx, cy, largest), mask
 
     # --------------------------------------------------------------
     # Red line detection (bottom of ROI)
@@ -368,13 +300,13 @@ class VisionAgent:
             return False
 
         gray_wide = cv2.cvtColor(wide_roi, cv2.COLOR_BGR2GRAY)
-        found = self._locate_line_simple(gray_wide, wide_roi)
+        found, _ = self._dana_find_line(gray_wide, wide_roi)
         if found is None:
             return False
 
-        cx, cy = found
-        real_x = cx + wx_start
-        real_y = cy + wy_start
+        cx_roi, cy_roi, _ = found
+        real_x = cx_roi + wx_start
+        real_y = cy_roi + wy_start
         result["line_center_x"] = real_x
         result["line_center_y"] = real_y
         result["special_state"] = "approach"
@@ -409,34 +341,18 @@ class VisionAgent:
         roi_h, roi_w = gray_roi.shape
 
         cv2.rectangle(frame, (roi_x_start, roi_start_y), (roi_x_end, h), (0, 255, 255), 2)
-        # Blue centre reference line (Dana style)
         roi_center_x = roi_x_start + roi_w // 2
         cv2.line(frame, (roi_center_x, roi_start_y), (roi_center_x, h), (255, 0, 0), 1)
         cv2.putText(frame, "ROI", (roi_x_start + 5, roi_start_y - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-        # ---- Step 1: Black line mask (Dana) ----
-        mask_black, mask_closed, mask_global, mask_adaptive, mask_color = \
-            self._improve_line_mask(gray_roi, roi)
+        # ---- Step 1: Dana line detection ----
+        found, mask = self._dana_find_line(gray_roi, roi)
 
-        # Debug layers
-        b_ch, g_ch, r_ch = cv2.split(roi)
-        color_threshold = 50
-        no_color = np.zeros_like(b_ch)
-        no_color[(b_ch < color_threshold) & (g_ch < color_threshold) & (r_ch < color_threshold)] = 255
-        result["cnn_layers"] = {
-            "Black_Mask": mask_black,
-            "Mask_Closed": mask_closed,
-            "R_Channel": r_ch,
-            "G_Channel": g_ch,
-            "B_Channel": b_ch,
-            "No_Color_Channel": no_color,
-        }
+        # Debug layer (single mask)
+        result["cnn_layers"] = {"Mask": mask}
 
-        # ---- Step 2: Find line via contour analysis ----
-        line_contour = self._find_line_contour(mask_black)
-
-        # ---- Step 3: Red line detection (bottom-centre of ROI) ----
+        # ---- Step 2: Red line detection (bottom-centre of ROI) ----
         red_line_now = self._detect_red_at_bottom(roi)
         if red_line_now:
             self._red_stop_counter = self.RED_LINE_STOP_FRAMES
@@ -447,66 +363,35 @@ class VisionAgent:
             cv2.putText(frame, "RED LINE STOP", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        if line_contour is not None and not result.get("red_line_detected"):
-            M = cv2.moments(line_contour)
-            if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"]) + roi_x_start
-                cy = int(M["m01"] / M["m00"])
-                result["line_center_x"] = cx
-                result["line_center_y"] = cy + roi_start_y
+        # ---- Step 3: Process line data ----
+        if found is not None and not result.get("red_line_detected"):
+            cx_roi, cy_roi, contour = found
+            cx = cx_roi + roi_x_start
+            cy = cy_roi
+            result["line_center_x"] = cx
+            result["line_center_y"] = cy + roi_start_y
 
-                # Centroid marker
-                cv2.circle(frame, (cx, cy + roi_start_y), 4, (0, 0, 255), -1)
+            cv2.circle(frame, (cx, cy + roi_start_y), 4, (0, 0, 255), -1)
 
-                # Heading arrow from fitLine
-                shifted = line_contour + np.array([roi_x_start, roi_start_y])
-                if len(shifted) >= 5:
-                    ellipse = cv2.fitEllipse(shifted)
-                    cv2.ellipse(frame, ellipse, (255, 100, 0), 2)
-                    [vx, vy, _, _] = cv2.fitLine(shifted, cv2.DIST_L2, 0, 0.01, 0.01)
-                    vx = vx.item()
-                    vy = vy.item()
-                    if vy > 0:
-                        vx = -vx
-                        vy = -vy
-                    length = 50
-                    pt2 = (int(cx + vx * length), int(cy + roi_start_y + vy * length))
-                    cv2.arrowedLine(frame, (cx, cy + roi_start_y), pt2,
-                                    (0, 255, 255), 3, tipLength=0.3)
-                else:
-                    cv2.drawContours(frame, [shifted], -1, (255, 100, 0), 2)
+            # Intersection detection via bounding rect width
+            x_box, y_box, w_line, h_line = cv2.boundingRect(contour)
+            width_ratio = w_line / max(1, roi_w)
+            if width_ratio > self.INTERSECTION_WIDTH_RATIO:
+                result["special_state"] = "intersection"
+                cv2.putText(frame, "INTERSECTION", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            elif width_ratio > self.APPROACH_INTERSECTION_WIDTH_RATIO:
+                result["special_state"] = "approaching_intersection"
+                cv2.putText(frame, "APPROACHING INTERSECTION", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
-                # Intersection detection via bounding box width ratio
-                x_box, y_box, w_line, h_line = cv2.boundingRect(line_contour)
-                width_ratio = w_line / max(1, roi_w)
-                if width_ratio > self.INTERSECTION_WIDTH_RATIO:
-                    result["special_state"] = "intersection"
-                    cv2.putText(frame, "INTERSECTION", (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                elif width_ratio > self.APPROACH_INTERSECTION_WIDTH_RATIO:
-                    result["special_state"] = "approaching_intersection"
-                    cv2.putText(frame, "APPROACHING INTERSECTION", (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
-
-                cv2.putText(frame, f"CX:{cx} W:{w_line}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(frame, f"CX:{cx} W:{w_line}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         elif not result.get("red_line_detected"):
-            # ---- Step 4: No line found — try seed / fallback ----
-            scan_y = min(roi_h - 2, int(roi_h * self.SCAN_HEIGHT_RATIO))
-            seed = self._scanline_seed(gray_roi, scan_y)
-            if seed is not None:
-                if self._prev_seed is not None:
-                    sx = int(round(self._seed_smoothing * seed[0] + (1.0 - self._seed_smoothing) * self._prev_seed[0]))
-                    seed = (sx, seed[1])
-                self._prev_seed = (seed[0], seed[1])
-                result["line_center_x"] = seed[0] + roi_x_start
-                result["line_center_y"] = seed[1] + roi_start_y
-                cv2.circle(frame, (seed[0] + roi_x_start, seed[1] + roi_start_y), 5, (0, 255, 0), -1)
-                cv2.putText(frame, f"Seed:{seed[0]}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            elif not self._try_wide_roi_fallback(frame, result):
-                cls = self._classify_line_end(mask_black, roi_h, roi_w, frame)
+            # ---- Step 4: No line — wide ROI fallback, then classify ----
+            if not self._try_wide_roi_fallback(frame, result):
+                cls = self._classify_line_end(mask, roi_h, roi_w, frame)
                 result.update(cls)
 
         return result

@@ -43,9 +43,9 @@ def main():
             if not sim_mode:
                 hw.set_speeds(left_speed, right_speed)
 
-            # Indicator logic based on new state machine
+            # Indicator logic
             red_led = (control.state == "STOPPED")
-            green_led = (control.state == "BACKTRACKING")
+            green_led = (control.state == "RECOVERING")
             buzzer = (vision_data.get("line_ended", False) or control.state == "SPINNING")
             hw.set_indicators(red_led=red_led, green_led=green_led, buzzer=buzzer)
 
