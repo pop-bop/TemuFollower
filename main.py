@@ -11,6 +11,8 @@ from config import (
     LINE_LOST_STOP_TIMEOUT_S, SLEW_RATE_PER_S, MANUAL_SPEED, MANUAL_KEY_TIMEOUT_S,
     SHOW_DEBUG_VIEW, DEBUG_VIEW_EVERY_N_FRAMES, LOOP_LOG_INTERVAL_S,
     INTEGRAL_LIMIT, LOW_CONFIDENCE_SPEED_SCALE,
+    ERROR_SPEED_REDUCTION, DERIVATIVE_SPEED_REDUCTION, STRAIGHT_SPEED_BOOST,
+    ADAPTIVE_DERIVATIVE_REF,
     MARKER_ACTION_DELAY_S,
     RED_LED_PIN, GREEN_LED_PIN,
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
@@ -345,7 +347,8 @@ def main():
 
                 abs_error = abs(error)
                 if abs_error <= CENTER_DEADZONE:
-                    target_forward = BASE_SPEED
+                    straight_bonus = STRAIGHT_SPEED_BOOST * (1.0 - abs_error / max(CENTER_DEADZONE, 0.001))
+                    target_forward = BASE_SPEED + straight_bonus
                     target_turn = motor_turn
                 else:
                     blend = clamp(
@@ -356,11 +359,21 @@ def main():
                     target_forward = BASE_SPEED * (1.0 - blend)
                     target_turn = motor_turn * (1.0 - blend) + (SHARP_TURN_SPEED * turn_sign) * blend
 
+                derivative_load = clamp(
+                    abs(derivative) / max(0.001, ADAPTIVE_DERIVATIVE_REF),
+                    0.0, 1.0,
+                )
+                stability_scale = 1.0 - (ERROR_SPEED_REDUCTION * abs_error)
+                stability_scale -= DERIVATIVE_SPEED_REDUCTION * derivative_load
+                target_forward *= clamp(stability_scale, MIN_SPEED / max(BASE_SPEED, 0.001), 1.0)
+
                 if line_confidence < 0.5:
                     confidence_scale = LOW_CONFIDENCE_SPEED_SCALE + (
                         (1.0 - LOW_CONFIDENCE_SPEED_SCALE) * line_confidence * 2.0
                     )
                     target_forward *= clamp(confidence_scale, LOW_CONFIDENCE_SPEED_SCALE, 1.0)
+
+                target_forward = clamp(target_forward, MIN_SPEED, MAX_SPEED)
 
                 search_direction = 1.0 if error >= 0 else -1.0
                 if STEER_INVERT:
@@ -510,7 +523,7 @@ def main():
                 turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
-                set_speeds(-0.2, 0.2, left_pwm, right_pwm)
+                set_speeds(applied_left, applied_right, left_pwm, right_pwm)
 
             else:
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
