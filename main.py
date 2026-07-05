@@ -12,7 +12,9 @@ from config import (
     SHOW_DEBUG_VIEW, DEBUG_VIEW_EVERY_N_FRAMES, LOOP_LOG_INTERVAL_S,
     INTEGRAL_LIMIT, LOW_CONFIDENCE_SPEED_SCALE,
     ERROR_SPEED_REDUCTION, DERIVATIVE_SPEED_REDUCTION, STRAIGHT_SPEED_BOOST,
-    ADAPTIVE_DERIVATIVE_REF,
+    ADAPTIVE_DERIVATIVE_REF, CURVE_SPEED_REDUCTION, CURVE_TURN_BOOST,
+    MIN_CURVE_SPEED_SCALE, NEAR_TRAJECTORY_WEIGHT, LOOKAHEAD_TRAJECTORY_WEIGHT,
+    LOOKAHEAD_CONFIDENCE_MIN, ACCEL_BUZZER_ENABLED, ACCEL_SPEED_DELTA_THRESHOLD,
     MARKER_ACTION_DELAY_S,
     RED_LED_PIN, GREEN_LED_PIN,
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
@@ -21,8 +23,8 @@ from config import (
 )
 from camera import open_camera, read_frame
 from vision import (
-    find_line_error_normal, find_line_error_wide, print_calibration_info,
-    detect_intersection_normal,
+    find_line_error_normal, find_line_error_lookahead, find_line_error_wide,
+    print_calibration_info, detect_intersection_normal,
 )
 from motors import setup_motors, set_speeds, slew_toward, stop_motors
 from indicators import (
@@ -33,6 +35,7 @@ from utils import clamp
 from debug_view import draw_debug_view, draw_roi_arrow_view
 from buffer import TemporalBuffer
 from adaptive_pid import schedule_pid_gains
+from trajectory import new_trajectory_state, reset_trajectory_state, rk4_step
 
 
 def main():
@@ -81,6 +84,10 @@ def main():
     current_kp = KP
     current_ki = KI
     current_kd = KD
+    trajectory_state = new_trajectory_state()
+    curve_sharpness = 0.0
+    curve_speed_scale = 1.0
+    prev_speed_for_accel = 0.0
 
     print("PID line following running. Press Ctrl+C to stop.")
     print("Manual indicator test keys: r=toggle red LED, g=toggle green LED, b=buzzer blip")
@@ -112,6 +119,10 @@ def main():
                     backtrack_start_time = None
                     rotate_settle_until = None
                     dead_end_recorded = False
+                    reset_trajectory_state(trajectory_state)
+                    curve_sharpness = 0.0
+                    curve_speed_scale = 1.0
+                    prev_speed_for_accel = 0.0
                     stop_motors(left_pwm, right_pwm)
                 elif key in (13, 10):
                     if mode != "AUTO":
@@ -129,6 +140,10 @@ def main():
                     rotate_settle_until = None
                     dead_end_recorded = False
                     spin_start_time = None
+                    reset_trajectory_state(trajectory_state)
+                    curve_sharpness = 0.0
+                    curve_speed_scale = 1.0
+                    prev_speed_for_accel = 0.0
                     stop_motors(left_pwm, right_pwm)
                     if halted:
                         print("MANUAL OVERRIDE: clearing red-marker halt")
@@ -156,9 +171,10 @@ def main():
 
             if halted:
                 stop_motors(left_pwm, right_pwm)
+                prev_speed_for_accel = 0.0
                 update_led(red_led_state, RED_LED_PIN, now)
                 update_led(green_led_state, GREEN_LED_PIN, now)
-                update_buzzer(buzzer_state, buzzer_pwm, now)
+                update_buzzer(buzzer_state, buzzer_pwm, now, False)
                 if SHOW_DEBUG_VIEW:
                     cv2.imshow("Camera + Decisions", frame)
                 continue
@@ -191,9 +207,13 @@ def main():
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
                 set_speeds(applied_left, applied_right, left_pwm, right_pwm)
 
+                current_speed_mag = abs(applied_forward)
+                accelerating = ACCEL_BUZZER_ENABLED and current_speed_mag > prev_speed_for_accel + ACCEL_SPEED_DELTA_THRESHOLD
+                prev_speed_for_accel = current_speed_mag
+
                 update_led(red_led_state, RED_LED_PIN, now)
                 update_led(green_led_state, GREEN_LED_PIN, now)
-                update_buzzer(buzzer_state, buzzer_pwm, now)
+                update_buzzer(buzzer_state, buzzer_pwm, now, accelerating)
                 prev_state = state
 
                 _, active_debug = find_line_error_normal(frame)
@@ -213,6 +233,9 @@ def main():
             target_turn = 0.0
             display_turn = None
             active_debug = normal_debug
+            lookahead_debug = None
+            curve_sharpness = 0.0
+            curve_speed_scale = 1.0
 
             # INTERSECTION DETECTION (only when centered on the line)
             if (state not in ("BACKTRACK", "ROTATE")
@@ -313,6 +336,7 @@ def main():
                                 integral = 0.0
                                 last_error = 0.0
                                 search_direction = 1.0
+                                reset_trajectory_state(trajectory_state)
                                 state = "FOLLOW"
                             else:
                                 turn = clamp(branch_error * ROTATE_SPEED * 2, -ROTATE_SPEED, ROTATE_SPEED)
@@ -329,7 +353,37 @@ def main():
             elif normal_error is not None:
                 state = "FOLLOW"
                 dead_end_recorded = False
-                error = normal_error
+
+                # Look ahead above the normal ROI to anticipate curves before
+                # the near ROI reacts to them.
+                lookahead_error, lookahead_debug = find_line_error_lookahead(frame)
+                lookahead_confidence = lookahead_debug.get("line_confidence", 0.0)
+
+                if lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN:
+                    curve = lookahead_error - normal_error
+                    # Trust the look-ahead ROI more at speed and when already
+                    # centered; fall back to the near ROI when off-center or
+                    # nearly stopped, since the near line is the safety anchor.
+                    speed_factor = clamp(abs(applied_forward) / max(BASE_SPEED, 0.001), 0.0, 1.0)
+                    off_center_factor = clamp(abs(normal_error) / max(CENTER_DEADZONE, 0.001), 0.0, 1.0)
+                    lookahead_trust = speed_factor * (1.0 - 0.5 * off_center_factor)
+                    lookahead_weight = LOOKAHEAD_TRAJECTORY_WEIGHT * lookahead_trust
+                    near_weight = NEAR_TRAJECTORY_WEIGHT + LOOKAHEAD_TRAJECTORY_WEIGHT * (1.0 - lookahead_trust)
+                    trajectory_target_error = (near_weight * normal_error) + (lookahead_weight * lookahead_error)
+                else:
+                    curve = 0.0
+                    trajectory_target_error = normal_error
+
+                predicted_error, predicted_heading = rk4_step(
+                    trajectory_state, trajectory_target_error, curve, dt,
+                )
+                curve_sharpness = clamp(abs(predicted_heading), 0.0, 1.0)
+                curve_speed_scale = clamp(
+                    1.0 - CURVE_SPEED_REDUCTION * curve_sharpness,
+                    MIN_CURVE_SPEED_SCALE, 1.0,
+                )
+
+                error = predicted_error
                 integral += error * dt
                 integral = clamp(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
                 derivative = (error - last_error) / dt
@@ -341,6 +395,7 @@ def main():
                 )
 
                 raw_turn = (current_kp * error) + (current_ki * integral) + (current_kd * derivative)
+                raw_turn *= 1.0 + CURVE_TURN_BOOST * curve_sharpness
                 raw_turn = clamp(raw_turn, -TURN_LIMIT, TURN_LIMIT)
                 display_turn = raw_turn
                 motor_turn = -raw_turn if STEER_INVERT else raw_turn
@@ -366,6 +421,7 @@ def main():
                 stability_scale = 1.0 - (ERROR_SPEED_REDUCTION * abs_error)
                 stability_scale -= DERIVATIVE_SPEED_REDUCTION * derivative_load
                 target_forward *= clamp(stability_scale, MIN_SPEED / max(BASE_SPEED, 0.001), 1.0)
+                target_forward *= curve_speed_scale
 
                 if line_confidence < 0.5:
                     confidence_scale = LOW_CONFIDENCE_SPEED_SCALE + (
@@ -475,9 +531,10 @@ def main():
             if halted:
                 if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
                     cv2.imshow("Camera + Decisions", frame)
+                prev_speed_for_accel = 0.0
                 update_led(red_led_state, RED_LED_PIN, now)
                 update_led(green_led_state, GREEN_LED_PIN, now)
-                update_buzzer(buzzer_state, buzzer_pwm, now)
+                update_buzzer(buzzer_state, buzzer_pwm, now, False)
                 continue
 
             # ----- STATE TRANSITION SOUNDS (unchanged) -----
@@ -533,15 +590,29 @@ def main():
                 set_speeds(applied_left, applied_right, left_pwm, right_pwm)
 
             # ----- LED / BUZZER UPDATES -----
+            current_speed_mag = abs(applied_forward)
+            accelerating = ACCEL_BUZZER_ENABLED and current_speed_mag > prev_speed_for_accel + ACCEL_SPEED_DELTA_THRESHOLD
+            prev_speed_for_accel = current_speed_mag
+
             update_led(red_led_state, RED_LED_PIN, now)
             update_led(green_led_state, GREEN_LED_PIN, now)
-            update_buzzer(buzzer_state, buzzer_pwm, now)
+            update_buzzer(buzzer_state, buzzer_pwm, now, accelerating)
 
             if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
+                extra_lines = None
+                lookahead_bounds = None
+                lookahead_point = None
+                if state == "FOLLOW" and lookahead_debug is not None:
+                    extra_lines = [f"curve={curve_sharpness:.2f} spd_scale={curve_speed_scale:.2f}"]
+                    lookahead_bounds = lookahead_debug["roi_bounds"]
+                    lookahead_point = lookahead_debug["line_point"]
                 draw_debug_view(
                     frame, active_debug,
                     normal_error if state == "FOLLOW" else None,
                     display_turn, applied_left, applied_right, state,
+                    extra_lines=extra_lines,
+                    lookahead_bounds=lookahead_bounds,
+                    lookahead_point=lookahead_point,
                 )
                 lean_ratio = (display_turn / TURN_LIMIT) if display_turn is not None else None
                 draw_roi_arrow_view(active_debug, applied_left, applied_right, state, lean_ratio)
@@ -552,7 +623,8 @@ def main():
                 print(
                     f"state={state:12s} forward={applied_forward:+.2f} turn={turn_component:+.2f}  "
                     f"L/R={applied_left:+.2f}/{applied_right:+.2f}  loop_ms={loop_ms:.1f} "
-                    f"fps={fps_ema:.1f} pid={current_kp:.2f}/{current_ki:.2f}/{current_kd:.2f}"
+                    f"fps={fps_ema:.1f} pid={current_kp:.2f}/{current_ki:.2f}/{current_kd:.2f} "
+                    f"curve={curve_sharpness:.2f}/{curve_speed_scale:.2f}"
                 )
 
     except KeyboardInterrupt:

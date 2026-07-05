@@ -6,7 +6,8 @@ from config import ROI_VIEW_SCALE, ARROW_MAX_DEFLECTION_DEG, MAX_SPEED
 from utils import clamp
 
 
-def draw_debug_view(frame, debug_info, error, turn, left, right, state):
+def draw_debug_view(frame, debug_info, error, turn, left, right, state,
+                     extra_lines=None, lookahead_bounds=None, lookahead_point=None):
     x0, y0, x1, y1 = debug_info["roi_bounds"]
     debug = frame.copy()
 
@@ -14,8 +15,15 @@ def draw_debug_view(frame, debug_info, error, turn, left, right, state):
     center_x = x0 + (x1 - x0) // 2
     cv2.line(debug, (center_x, y0), (center_x, y1), (255, 0, 0), 1)
 
+    if lookahead_bounds is not None:
+        lx0, ly0, lx1, ly1 = lookahead_bounds
+        cv2.rectangle(debug, (lx0, ly0), (lx1, ly1), (255, 128, 0), 1)
+
     if debug_info["line_point"] is not None:
         cv2.circle(debug, debug_info["line_point"], 5, (0, 0, 255), -1)
+
+    if lookahead_point is not None:
+        cv2.circle(debug, lookahead_point, 5, (255, 128, 0), -1)
 
     lines = [
         f"state: {state}",
@@ -23,6 +31,8 @@ def draw_debug_view(frame, debug_info, error, turn, left, right, state):
         f"turn:  {turn:+.3f}" if turn is not None else "turn:  none",
         f"L/R:   {left:+.2f} / {right:+.2f}" if left is not None else "L/R:   none",
     ]
+    if extra_lines:
+        lines.extend(extra_lines)
     for i, text in enumerate(lines):
         cv2.putText(debug, text, (8, 18 + i * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 

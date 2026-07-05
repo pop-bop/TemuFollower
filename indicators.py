@@ -1,6 +1,9 @@
 import RPi.GPIO as GPIO
 
-from config import RED_LED_PIN, GREEN_LED_PIN, BUZZER_PIN
+from config import (
+    RED_LED_PIN, GREEN_LED_PIN, BUZZER_PIN,
+    ACCEL_BUZZER_FREQ_HZ, ACCEL_BUZZER_DUTY,
+)
 
 
 TONES = {
@@ -49,7 +52,7 @@ def update_led(led_state, pin, now):
 
 
 def new_buzzer_state():
-    return {"queue": [], "seg_start": None}
+    return {"queue": [], "seg_start": None, "accel_active": False}
 
 
 def play_tone(buzzer_state, name):
@@ -57,20 +60,29 @@ def play_tone(buzzer_state, name):
     buzzer_state["seg_start"] = None
 
 
-def update_buzzer(buzzer_state, buzzer_pwm, now):
-    if not buzzer_state["queue"]:
-        return
-    freq, on_ms, off_ms = buzzer_state["queue"][0]
-    if buzzer_state["seg_start"] is None:
-        buzzer_state["seg_start"] = now
-        buzzer_pwm.ChangeFrequency(freq)
-        buzzer_pwm.ChangeDutyCycle(50)
-    elapsed_ms = (now - buzzer_state["seg_start"]) * 1000.0
-    if elapsed_ms < on_ms:
-        return
-    if elapsed_ms < on_ms + off_ms:
+def update_buzzer(buzzer_state, buzzer_pwm, now, accelerating=False):
+    if buzzer_state["queue"]:
+        buzzer_state["accel_active"] = False
+        freq, on_ms, off_ms = buzzer_state["queue"][0]
+        if buzzer_state["seg_start"] is None:
+            buzzer_state["seg_start"] = now
+            buzzer_pwm.ChangeFrequency(freq)
+            buzzer_pwm.ChangeDutyCycle(50)
+        elapsed_ms = (now - buzzer_state["seg_start"]) * 1000.0
+        if elapsed_ms < on_ms:
+            return
+        if elapsed_ms < on_ms + off_ms:
+            buzzer_pwm.ChangeDutyCycle(0)
+            return
+        buzzer_state["queue"].pop(0)
+        buzzer_state["seg_start"] = None
         buzzer_pwm.ChangeDutyCycle(0)
         return
-    buzzer_state["queue"].pop(0)
-    buzzer_state["seg_start"] = None
-    buzzer_pwm.ChangeDutyCycle(0)
+
+    if accelerating and not buzzer_state["accel_active"]:
+        buzzer_state["accel_active"] = True
+        buzzer_pwm.ChangeFrequency(ACCEL_BUZZER_FREQ_HZ)
+        buzzer_pwm.ChangeDutyCycle(ACCEL_BUZZER_DUTY)
+    elif not accelerating and buzzer_state["accel_active"]:
+        buzzer_state["accel_active"] = False
+        buzzer_pwm.ChangeDutyCycle(0)
