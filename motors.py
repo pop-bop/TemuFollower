@@ -47,10 +47,18 @@ def set_speeds(left, right, left_pwm, right_pwm):
 
 def slew_toward(current, target, max_step):
     if target > current:
-        return min(target, current + max_step)
-    if target < current:
-        return max(target, current - max_step)
-    return current
+        stepped = min(target, current + max_step)
+    elif target < current:
+        stepped = max(target, current - max_step)
+    else:
+        return current
+
+    # Force a stop before reversing direction, even if max_step is large
+    # enough (e.g. from a slow/stuttered frame) to jump straight past zero
+    # into a fast reverse in a single step.
+    if (current > 0.0 and stepped < 0.0) or (current < 0.0 and stepped > 0.0):
+        return 0.0
+    return stepped
 
 
 def stop_motors(left_pwm, right_pwm):
