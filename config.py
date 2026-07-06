@@ -20,9 +20,6 @@ TURN_SLEW_RATE_PER_S = 2.2     # max rate turn_component may change per second (
 REAR_GRIP_SPEED_DERATE = 0.45  # how much max turn authority shrinks as forward speed rises
 MIN_TURN_AUTHORITY_SCALE = 0.55
 
-# Poke-out recovery: replay recent motor commands in reverse to retrace the line
-TRAIL_MAX_AGE_S = 3.0   # how much recent command history is kept / max retrace duration
-
 # Disable OpenCV's own internal thread pool so it doesn't oversubscribe against
 # the app's own capture/lookahead threads.
 CV2_NUM_THREADS = 1
@@ -41,6 +38,10 @@ LOOKAHEAD_CONFIDENCE_MIN = 0.25
 RK4_TRAJECTORY_GAIN = 10.0
 RK4_HEADING_GAIN = 8.0
 RK4_MAX_DT = 0.05
+# Untested on hardware (crashed every time it ran until the lookahead_debug bug
+# was fixed). Set False to bypass RK4/curve-boost/lookahead-blend and drive on
+# raw normal_error, so you can confirm the base PID is stable before re-enabling.
+TRAJECTORY_PREDICTION_ENABLED = False
 
 # SPEEDS
 SHARP_TURN_SPEED = 0.50

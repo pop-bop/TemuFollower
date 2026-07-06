@@ -15,14 +15,15 @@ from config import (
     ERROR_SPEED_REDUCTION, DERIVATIVE_SPEED_REDUCTION, STRAIGHT_SPEED_BOOST,
     ADAPTIVE_DERIVATIVE_REF, CURVE_SPEED_REDUCTION, CURVE_TURN_BOOST,
     MIN_CURVE_SPEED_SCALE, NEAR_TRAJECTORY_WEIGHT, LOOKAHEAD_TRAJECTORY_WEIGHT,
-    LOOKAHEAD_CONFIDENCE_MIN, ACCEL_BUZZER_ENABLED, ACCEL_SPEED_DELTA_THRESHOLD,
+    LOOKAHEAD_CONFIDENCE_MIN, TRAJECTORY_PREDICTION_ENABLED,
+    ACCEL_BUZZER_ENABLED, ACCEL_SPEED_DELTA_THRESHOLD,
     MARKER_ACTION_DELAY_S,
     RED_LED_PIN, GREEN_LED_PIN,
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
     INTERSECTION_COOLDOWN_S, INTERSECTION_MEMORY_MAX_AGE_S,
     MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO, ROTATE_SETTLE_TIME_S,
     REAR_WEIGHT_RATIO, REAR_GRIP_SPEED_DERATE, TURN_SLEW_RATE_PER_S,
-    MIN_TURN_AUTHORITY_SCALE, TRAIL_MAX_AGE_S, CV2_NUM_THREADS,
+    MIN_TURN_AUTHORITY_SCALE, CV2_NUM_THREADS,
 )
 from camera import open_camera, read_frame, CameraError
 from vision import (
@@ -39,7 +40,6 @@ from debug_view import draw_debug_view, draw_roi_arrow_view
 from buffer import TemporalBuffer
 from adaptive_pid import schedule_pid_gains
 from trajectory import new_trajectory_state, reset_trajectory_state, rk4_step
-from trail import new_trail, record_sample, pop_retrace_step
 
 
 def _apply_turn(applied_turn, target_turn, applied_forward, dt):
@@ -74,9 +74,6 @@ def main():
     applied_turn = 0.0
     state = "FOLLOW"
     spin_start_time = None
-    command_trail = new_trail()
-    retrace_sample = None
-    retrace_elapsed = 0.0
     lookahead_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lookahead")
     pending_lookahead_future = None
     search_direction = 1.0
@@ -151,9 +148,6 @@ def main():
                     rotate_settle_until = None
                     dead_end_recorded = False
                     reset_trajectory_state(trajectory_state)
-                    command_trail.clear()
-                    retrace_sample = None
-                    retrace_elapsed = 0.0
                     pending_lookahead_future = None
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
@@ -179,9 +173,6 @@ def main():
                     dead_end_recorded = False
                     spin_start_time = None
                     reset_trajectory_state(trajectory_state)
-                    command_trail.clear()
-                    retrace_sample = None
-                    retrace_elapsed = 0.0
                     pending_lookahead_future = None
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
@@ -404,9 +395,6 @@ def main():
                                 last_error = 0.0
                                 search_direction = 1.0
                                 reset_trajectory_state(trajectory_state)
-                                command_trail.clear()
-                                retrace_sample = None
-                                retrace_elapsed = 0.0
                                 pending_lookahead_future = None
                                 state = "FOLLOW"
                             else:
@@ -425,37 +413,40 @@ def main():
                 state = "FOLLOW"
                 dead_end_recorded = False
 
-                # Look ahead above the normal ROI to anticipate curves before
-                # the near ROI reacts to them. lookahead_error/lookahead_debug were
-                # already collected above (computed one frame ago, in parallel with
-                # this frame's normal-ROI processing).
-                lookahead_confidence = lookahead_debug.get("line_confidence", 0.0)
+                if TRAJECTORY_PREDICTION_ENABLED:
+                    # Look ahead above the normal ROI to anticipate curves before
+                    # the near ROI reacts to them. lookahead_error/lookahead_debug were
+                    # already collected above (computed one frame ago, in parallel with
+                    # this frame's normal-ROI processing).
+                    lookahead_confidence = lookahead_debug.get("line_confidence", 0.0)
 
-                if lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN:
-                    curve = lookahead_error - normal_error
-                    # Trust the look-ahead ROI more at speed and when already
-                    # centered; fall back to the near ROI when off-center or
-                    # nearly stopped, since the near line is the safety anchor.
-                    speed_factor = clamp(abs(applied_forward) / max(BASE_SPEED, 0.001), 0.0, 1.0)
-                    off_center_factor = clamp(abs(normal_error) / max(CENTER_DEADZONE, 0.001), 0.0, 1.0)
-                    lookahead_trust = speed_factor * (1.0 - 0.5 * off_center_factor)
-                    lookahead_weight = LOOKAHEAD_TRAJECTORY_WEIGHT * lookahead_trust
-                    near_weight = NEAR_TRAJECTORY_WEIGHT + LOOKAHEAD_TRAJECTORY_WEIGHT * (1.0 - lookahead_trust)
-                    trajectory_target_error = (near_weight * normal_error) + (lookahead_weight * lookahead_error)
+                    if lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN:
+                        curve = lookahead_error - normal_error
+                        # Trust the look-ahead ROI more at speed and when already
+                        # centered; fall back to the near ROI when off-center or
+                        # nearly stopped, since the near line is the safety anchor.
+                        speed_factor = clamp(abs(applied_forward) / max(BASE_SPEED, 0.001), 0.0, 1.0)
+                        off_center_factor = clamp(abs(normal_error) / max(CENTER_DEADZONE, 0.001), 0.0, 1.0)
+                        lookahead_trust = speed_factor * (1.0 - 0.5 * off_center_factor)
+                        lookahead_weight = LOOKAHEAD_TRAJECTORY_WEIGHT * lookahead_trust
+                        near_weight = NEAR_TRAJECTORY_WEIGHT + LOOKAHEAD_TRAJECTORY_WEIGHT * (1.0 - lookahead_trust)
+                        trajectory_target_error = (near_weight * normal_error) + (lookahead_weight * lookahead_error)
+                    else:
+                        curve = 0.0
+                        trajectory_target_error = normal_error
+
+                    predicted_error, predicted_heading = rk4_step(
+                        trajectory_state, trajectory_target_error, curve, dt,
+                    )
+                    curve_sharpness = clamp(abs(predicted_heading), 0.0, 1.0)
+                    curve_speed_scale = clamp(
+                        1.0 - CURVE_SPEED_REDUCTION * curve_sharpness,
+                        MIN_CURVE_SPEED_SCALE, 1.0,
+                    )
+
+                    error = predicted_error
                 else:
-                    curve = 0.0
-                    trajectory_target_error = normal_error
-
-                predicted_error, predicted_heading = rk4_step(
-                    trajectory_state, trajectory_target_error, curve, dt,
-                )
-                curve_sharpness = clamp(abs(predicted_heading), 0.0, 1.0)
-                curve_speed_scale = clamp(
-                    1.0 - CURVE_SPEED_REDUCTION * curve_sharpness,
-                    MIN_CURVE_SPEED_SCALE, 1.0,
-                )
-
-                error = predicted_error
+                    error = normal_error
                 integral += error * dt
                 integral = clamp(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
                 derivative = (error - last_error) / dt
@@ -544,73 +535,54 @@ def main():
                 else:
                     active_debug = wide_debug
 
-                    if state in ("FOLLOW", "APPROACH"):
-                        state = "TRAIL_RETRACE"
-                        retrace_sample = None
-                        retrace_elapsed = 0.0
-                    elif state != "TRAIL_RETRACE":
-                        state = "SPIN_SEARCH"
+                    state = "SPIN_SEARCH"
 
-                    if state == "TRAIL_RETRACE":
-                        retrace_elapsed += dt
-                        if retrace_sample is None or retrace_elapsed >= retrace_sample["dt"]:
-                            retrace_sample = pop_retrace_step(command_trail)
-                            retrace_elapsed = 0.0
+                    if spin_start_time is None:
+                        spin_start_time = now
 
-                        if retrace_sample is None:
-                            print("TRAIL RETRACE: no recent path history, falling back to spin search")
-                            state = "SPIN_SEARCH"
-                        else:
-                            target_forward = -retrace_sample["forward"]
-                            target_turn = -retrace_sample["turn"]
+                    if now - spin_start_time < LINE_LOST_STOP_TIMEOUT_S:
+                        target_forward = 0.0
+                        target_turn = -SPIN_SEARCH_SPEED * search_direction
+                    else:
+                        # Dead end: try backtracking if we have intersection history
+                        if not dead_end_recorded:
+                            buffer.record_dead_end(frame=frame, state=state)
+                            dead_end_recorded = True
 
-                    if state == "SPIN_SEARCH":
-                        if spin_start_time is None:
-                            spin_start_time = now
-
-                        if now - spin_start_time < LINE_LOST_STOP_TIMEOUT_S:
-                            target_forward = 0.0
-                            target_turn = -SPIN_SEARCH_SPEED * search_direction
-                        else:
-                            # Dead end: try backtracking if we have intersection history
-                            if not dead_end_recorded:
-                                buffer.record_dead_end(frame=frame, state=state)
-                                dead_end_recorded = True
-
-                            if backtrack_intersection_wp is None:
-                                target_wp, hops = buffer.find_backtrack_target(
-                                    now, max_age=INTERSECTION_MEMORY_MAX_AGE_S,
-                                )
-                                if target_wp is not None:
-                                    branch_idx, branch = buffer.find_untried_branch(target_wp)
-                                    if branch is not None:
-                                        print(f"DEAD END: backtracking {hops + 1} intersection(s) back, "
-                                              f"trying branch {branch_idx}")
-                                        backtrack_intersection_wp = target_wp
-                                        backtrack_target_branch_idx = branch_idx
-                                        backtrack_pass_remaining = hops
-                                        awaiting_intersection_clear = False
-                                        backtrack_start_time = now
-                                        rotate_settle_until = None
-                                        buffer.mark_chosen_branch_taken(target_wp)
-                                        state = "BACKTRACK"
-                                        target_forward = 0.0
-                                        target_turn = 0.0
-                                    else:
-                                        target_forward = 0.0
-                                        target_turn = 0.0
-                                else:
-                                    print("DEAD END: no untried intersection branch found anywhere in memory")
-                                    state = "STOP"
-                                    backtrack_intersection_wp = None
-                                    backtrack_target_branch_idx = None
-                                    backtrack_pass_remaining = 0
+                        if backtrack_intersection_wp is None:
+                            target_wp, hops = buffer.find_backtrack_target(
+                                now, max_age=INTERSECTION_MEMORY_MAX_AGE_S,
+                            )
+                            if target_wp is not None:
+                                branch_idx, branch = buffer.find_untried_branch(target_wp)
+                                if branch is not None:
+                                    print(f"DEAD END: backtracking {hops + 1} intersection(s) back, "
+                                          f"trying branch {branch_idx}")
+                                    backtrack_intersection_wp = target_wp
+                                    backtrack_target_branch_idx = branch_idx
+                                    backtrack_pass_remaining = hops
                                     awaiting_intersection_clear = False
+                                    backtrack_start_time = now
+                                    rotate_settle_until = None
+                                    buffer.mark_chosen_branch_taken(target_wp)
+                                    state = "BACKTRACK"
+                                    target_forward = 0.0
+                                    target_turn = 0.0
+                                else:
                                     target_forward = 0.0
                                     target_turn = 0.0
                             else:
+                                print("DEAD END: no untried intersection branch found anywhere in memory")
+                                state = "STOP"
+                                backtrack_intersection_wp = None
+                                backtrack_target_branch_idx = None
+                                backtrack_pass_remaining = 0
+                                awaiting_intersection_clear = False
                                 target_forward = 0.0
                                 target_turn = 0.0
+                        else:
+                            target_forward = 0.0
+                            target_turn = 0.0
 
             # ----- MARKER ACTION (unchanged) -----
             if pending_marker_color is not None and now >= pending_marker_action_time:
@@ -642,7 +614,7 @@ def main():
                     "APPROACH": "state_approach",
                     "FOLLOW": "state_follow",
                 }[state])
-            elif state != prev_state and state in ("BACKTRACK", "ROTATE", "TRAIL_RETRACE"):
+            elif state != prev_state and state in ("BACKTRACK", "ROTATE"):
                 play_tone(buzzer_state, "sharp_turn")
 
             is_sharp_turn = state == "FOLLOW" and abs(target_turn) > SHARP_TURN_SPEED * 0.6
@@ -693,8 +665,6 @@ def main():
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
                 set_speeds(applied_left, applied_right, left_pwm, right_pwm)
-                if state in ("FOLLOW", "APPROACH"):
-                    record_sample(command_trail, applied_forward, applied_turn, dt, now, TRAIL_MAX_AGE_S)
 
             # ----- LED / BUZZER UPDATES -----
             current_speed_mag = abs(applied_forward)
