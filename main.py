@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import RPi.GPIO as GPIO
@@ -21,7 +22,7 @@ from config import (
     INTERSECTION_COOLDOWN_S, INTERSECTION_MEMORY_MAX_AGE_S,
     MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO, ROTATE_SETTLE_TIME_S,
 )
-from camera import open_camera, read_frame
+from camera import open_camera, FrameGrabber
 from vision import (
     find_line_error_normal, find_line_error_lookahead, find_line_error_wide,
     print_calibration_info, detect_intersection_normal,
@@ -40,10 +41,15 @@ from trajectory import new_trajectory_state, reset_trajectory_state, rk4_step
 
 def main():
     camera_kind, camera = open_camera()
+    grabber = FrameGrabber(camera_kind, camera)
+    vision_executor = ThreadPoolExecutor(max_workers=2)
     left_pwm, right_pwm = setup_motors()
     buzzer_pwm = setup_indicators()
 
-    first_frame = read_frame(camera_kind, camera)
+    first_frame = None
+    first_frame_wait_start = time.perf_counter()
+    while first_frame is None and time.perf_counter() - first_frame_wait_start < 5.0:
+        first_frame = grabber.get_latest()
     if first_frame is not None:
         print_calibration_info(first_frame)
 
@@ -165,7 +171,7 @@ def main():
                     play_tone(buzzer_state, "manual_test")
                     print("BUZZER manual test tone")
 
-            frame = read_frame(camera_kind, camera)
+            frame = grabber.get_latest()
             if frame is None:
                 continue
 
@@ -227,6 +233,10 @@ def main():
                 continue
 
             # ===== AUTO MODE: VISION + STATE MACHINE =====
+            # Lookahead runs on a background thread in parallel with the normal
+            # ROI scan below -- they're independent cv2 passes over the same
+            # frame, so there's no reason to pay their cost sequentially.
+            lookahead_future = vision_executor.submit(find_line_error_lookahead, frame)
             normal_error, normal_debug = find_line_error_normal(frame)
 
             target_forward = 0.0
@@ -355,8 +365,8 @@ def main():
                 dead_end_recorded = False
 
                 # Look ahead above the normal ROI to anticipate curves before
-                # the near ROI reacts to them.
-                lookahead_error, lookahead_debug = find_line_error_lookahead(frame)
+                # the near ROI reacts to them (computed concurrently above).
+                lookahead_error, lookahead_debug = lookahead_future.result()
                 lookahead_confidence = lookahead_debug.get("line_confidence", 0.0)
 
                 if lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN:
@@ -638,6 +648,8 @@ def main():
         GPIO.output(GREEN_LED_PIN, GPIO.LOW)
         buzzer_pwm.stop()
         GPIO.cleanup()
+        grabber.stop()
+        vision_executor.shutdown(wait=False)
         if camera_kind == "picamera2":
             camera.stop()
         else:
