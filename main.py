@@ -287,7 +287,6 @@ def main():
             target_turn = 0.0
             display_turn = None
             active_debug = normal_debug
-            lookahead_debug = None
             curve_sharpness = 0.0
             curve_speed_scale = 1.0
 
