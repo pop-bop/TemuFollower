@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import RPi.GPIO as GPIO
@@ -20,11 +21,13 @@ from config import (
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
     INTERSECTION_COOLDOWN_S, INTERSECTION_MEMORY_MAX_AGE_S,
     MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO, ROTATE_SETTLE_TIME_S,
+    REAR_WEIGHT_RATIO, REAR_GRIP_SPEED_DERATE, TURN_SLEW_RATE_PER_S,
+    MIN_TURN_AUTHORITY_SCALE, TRAIL_MAX_AGE_S, CV2_NUM_THREADS,
 )
-from camera import open_camera, read_frame
+from camera import open_camera, read_frame, CameraError
 from vision import (
-    find_line_error_normal, find_line_error_lookahead, find_line_error_wide,
-    print_calibration_info, detect_intersection_normal,
+    process_normal_roi, find_line_error_lookahead, find_line_error_wide,
+    print_calibration_info,
 )
 from motors import setup_motors, set_speeds, slew_toward, stop_motors
 from indicators import (
@@ -36,9 +39,26 @@ from debug_view import draw_debug_view, draw_roi_arrow_view
 from buffer import TemporalBuffer
 from adaptive_pid import schedule_pid_gains
 from trajectory import new_trajectory_state, reset_trajectory_state, rk4_step
+from trail import new_trail, record_sample, pop_retrace_step
+
+
+def _apply_turn(applied_turn, target_turn, applied_forward, dt):
+    speed_ratio = clamp(abs(applied_forward) / max(MAX_SPEED, 0.001), 0.0, 1.0)
+    turn_authority_scale = clamp(
+        1.0 - REAR_GRIP_SPEED_DERATE * speed_ratio * (1.0 - REAR_WEIGHT_RATIO),
+        MIN_TURN_AUTHORITY_SCALE, 1.0,
+    )
+    turn_limit = MAX_TURN_SPEED * turn_authority_scale
+    target_turn = clamp(target_turn, -turn_limit, turn_limit)
+    return slew_toward(applied_turn, target_turn, TURN_SLEW_RATE_PER_S * dt)
 
 
 def main():
+    cv2.setNumThreads(CV2_NUM_THREADS)
+    for line in cv2.getBuildInformation().splitlines():
+        if "NEON" in line:
+            print(f"OpenCV build info: {line.strip()}")
+
     camera_kind, camera = open_camera()
     left_pwm, right_pwm = setup_motors()
     buzzer_pwm = setup_indicators()
@@ -51,8 +71,14 @@ def main():
     last_error = 0.0
     last_time = time.perf_counter()
     applied_forward = 0.0
+    applied_turn = 0.0
     state = "FOLLOW"
     spin_start_time = None
+    command_trail = new_trail()
+    retrace_sample = None
+    retrace_elapsed = 0.0
+    lookahead_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lookahead")
+    pending_lookahead_future = None
     search_direction = 1.0
     mode = "AUTO"
     last_manual_key_time = time.perf_counter()
@@ -74,6 +100,8 @@ def main():
     buffer = TemporalBuffer(max_size=MAX_WAYPOINTS)
     backtrack_intersection_wp = None
     backtrack_target_branch_idx = None
+    backtrack_pass_remaining = 0
+    awaiting_intersection_clear = False
     backtrack_start_time = None
     rotate_settle_until = None
     last_intersection_time = 0.0
@@ -111,15 +139,22 @@ def main():
                         print("SWITCHED TO MANUAL: use w/a/s/d, space=stop, enter=back to auto")
                     mode = "MANUAL"
                     applied_forward = 0.0
+                    applied_turn = 0.0
                     last_manual_command = None
                     pending_marker_color = None
                     pending_marker_action_time = None
                     backtrack_intersection_wp = None
                     backtrack_target_branch_idx = None
+                    backtrack_pass_remaining = 0
+                    awaiting_intersection_clear = False
                     backtrack_start_time = None
                     rotate_settle_until = None
                     dead_end_recorded = False
                     reset_trajectory_state(trajectory_state)
+                    command_trail.clear()
+                    retrace_sample = None
+                    retrace_elapsed = 0.0
+                    pending_lookahead_future = None
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
                     prev_speed_for_accel = 0.0
@@ -130,17 +165,24 @@ def main():
                     mode = "AUTO"
                     state = "FOLLOW"
                     applied_forward = 0.0
+                    applied_turn = 0.0
                     integral = 0.0
                     last_error = 0.0
                     pending_marker_color = None
                     pending_marker_action_time = None
                     backtrack_intersection_wp = None
                     backtrack_target_branch_idx = None
+                    backtrack_pass_remaining = 0
+                    awaiting_intersection_clear = False
                     backtrack_start_time = None
                     rotate_settle_until = None
                     dead_end_recorded = False
                     spin_start_time = None
                     reset_trajectory_state(trajectory_state)
+                    command_trail.clear()
+                    retrace_sample = None
+                    retrace_elapsed = 0.0
+                    pending_lookahead_future = None
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
                     prev_speed_for_accel = 0.0
@@ -170,7 +212,13 @@ def main():
                 continue
 
             if halted:
-                stop_motors(left_pwm, right_pwm)
+                applied_forward = slew_toward(applied_forward, 0.0, max_step)
+                applied_turn = _apply_turn(applied_turn, 0.0, applied_forward, dt)
+                turn_component = applied_turn
+                applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
+                applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
+                set_speeds(applied_left, applied_right, left_pwm, right_pwm)
+                
                 prev_speed_for_accel = 0.0
                 update_led(red_led_state, RED_LED_PIN, now)
                 update_led(green_led_state, GREEN_LED_PIN, now)
@@ -216,8 +264,8 @@ def main():
                 update_buzzer(buzzer_state, buzzer_pwm, now, accelerating)
                 prev_state = state
 
-                _, active_debug = find_line_error_normal(frame)
                 if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
+                    _, active_debug, _ = process_normal_roi(frame, find_intersections=False)
                     draw_debug_view(frame, active_debug, None, None, applied_left, applied_right, state)
                     draw_roi_arrow_view(active_debug, applied_left, applied_right, state)
 
@@ -227,7 +275,13 @@ def main():
                 continue
 
             # ===== AUTO MODE: VISION + STATE MACHINE =====
-            normal_error, normal_debug = find_line_error_normal(frame)
+            if pending_lookahead_future is not None:
+                lookahead_error, lookahead_debug = pending_lookahead_future.result()
+            else:
+                lookahead_error, lookahead_debug = None, {}
+            pending_lookahead_future = lookahead_pool.submit(find_line_error_lookahead, frame)
+
+            normal_error, normal_debug, normal_intersection = process_normal_roi(frame, find_intersections=True)
 
             target_forward = 0.0
             target_turn = 0.0
@@ -242,7 +296,7 @@ def main():
                     and normal_error is not None
                     and abs(normal_error) < CENTER_DEADZONE * 2):
                 if now - last_intersection_time > INTERSECTION_COOLDOWN_S:
-                    intersection = detect_intersection_normal(frame)
+                    intersection = normal_intersection
                     if intersection:
                         inter_wp = buffer.record(
                             frame=frame, state=state, error=normal_error,
@@ -256,17 +310,23 @@ def main():
 
             # ----- BACKTRACK: reverse along the line to reach last intersection -----
             if state == "BACKTRACK":
-                backtrack_err, backtrack_debug = find_line_error_normal(frame)
+                backtrack_err, backtrack_debug, inter = normal_error, normal_debug, normal_intersection
                 active_debug = backtrack_debug
-
-                inter = detect_intersection_normal(frame)
-                if inter:
-                    print(f"BACKTRACK: reached intersection ({inter['branch_count']} branches)")
-                    stop_motors(left_pwm, right_pwm)
-                    backtrack_start_time = None
-                    rotate_settle_until = now + ROTATE_SETTLE_TIME_S
-                    state = "ROTATE"
-                    continue
+                if inter and not awaiting_intersection_clear:
+                    if backtrack_pass_remaining > 0:
+                        backtrack_pass_remaining -= 1
+                        awaiting_intersection_clear = True
+                        print(f"BACKTRACK: passing exhausted intersection, "
+                              f"{backtrack_pass_remaining} more to pass")
+                    else:
+                        print(f"BACKTRACK: reached intersection ({inter['branch_count']} branches)")
+                        stop_motors(left_pwm, right_pwm)
+                        backtrack_start_time = None
+                        rotate_settle_until = now + ROTATE_SETTLE_TIME_S
+                        state = "ROTATE"
+                        continue
+                elif not inter:
+                    awaiting_intersection_clear = False
 
                 if backtrack_err is not None:
                     error = backtrack_err
@@ -275,7 +335,7 @@ def main():
                     display_turn = raw_turn
                     motor_turn = -raw_turn if STEER_INVERT else raw_turn
                     target_forward = -BACKTRACK_SPEED
-                    target_turn = motor_turn
+                    target_turn = -motor_turn  # Invert steering when moving backwards
                 else:
                     wide_err, wide_debug = find_line_error_wide(frame)
                     active_debug = wide_debug
@@ -289,6 +349,10 @@ def main():
                         if backtrack_start_time and now - backtrack_start_time > BACKTRACK_SEARCH_TIMEOUT_S:
                             print("BACKTRACK FAILED: intersection not found")
                             stop_motors(left_pwm, right_pwm)
+                            backtrack_intersection_wp = None
+                            backtrack_target_branch_idx = None
+                            backtrack_pass_remaining = 0
+                            awaiting_intersection_clear = False
                             state = "STOP"
                         else:
                             target_forward = 0.0
@@ -313,11 +377,13 @@ def main():
                         print("ROTATE TIMEOUT: giving up")
                         backtrack_intersection_wp = None
                         backtrack_target_branch_idx = None
+                        backtrack_pass_remaining = 0
+                        awaiting_intersection_clear = False
                         backtrack_start_time = None
                         rotate_settle_until = None
                         state = "STOP"
                     else:
-                        inter = detect_intersection_normal(frame)
+                        inter = normal_intersection
                         if inter and backtrack_target_branch_idx is not None and backtrack_target_branch_idx < len(inter["branches"]):
                             target_branch = inter["branches"][backtrack_target_branch_idx]
                             roi_w = frame.shape[1] * (ROI_X_END_RATIO - ROI_X_START_RATIO)
@@ -330,6 +396,8 @@ def main():
                                     buffer.clear_after(backtrack_intersection_wp["timestamp"])
                                 backtrack_intersection_wp = None
                                 backtrack_target_branch_idx = None
+                                backtrack_pass_remaining = 0
+                                awaiting_intersection_clear = False
                                 backtrack_start_time = None
                                 rotate_settle_until = None
                                 dead_end_recorded = False
@@ -337,6 +405,10 @@ def main():
                                 last_error = 0.0
                                 search_direction = 1.0
                                 reset_trajectory_state(trajectory_state)
+                                command_trail.clear()
+                                retrace_sample = None
+                                retrace_elapsed = 0.0
+                                pending_lookahead_future = None
                                 state = "FOLLOW"
                             else:
                                 turn = clamp(branch_error * ROTATE_SPEED * 2, -ROTATE_SPEED, ROTATE_SPEED)
@@ -355,8 +427,9 @@ def main():
                 dead_end_recorded = False
 
                 # Look ahead above the normal ROI to anticipate curves before
-                # the near ROI reacts to them.
-                lookahead_error, lookahead_debug = find_line_error_lookahead(frame)
+                # the near ROI reacts to them. lookahead_error/lookahead_debug were
+                # already collected above (computed one frame ago, in parallel with
+                # this frame's normal-ROI processing).
                 lookahead_confidence = lookahead_debug.get("line_confidence", 0.0)
 
                 if lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN:
@@ -470,48 +543,75 @@ def main():
                         search_direction = -search_direction
                     spin_start_time = None
                 else:
-                    state = "SPIN_SEARCH"
                     active_debug = wide_debug
-                    if spin_start_time is None:
-                        spin_start_time = now
 
-                    if now - spin_start_time < LINE_LOST_STOP_TIMEOUT_S:
-                        target_forward = 0.0
-                        target_turn = -SPIN_SEARCH_SPEED * search_direction
-                    else:
-                        # Dead end: try backtracking if we have intersection history
-                        if not dead_end_recorded:
-                            buffer.record_dead_end(frame=frame, state=state)
-                            dead_end_recorded = True
+                    if state in ("FOLLOW", "APPROACH"):
+                        state = "TRAIL_RETRACE"
+                        retrace_sample = None
+                        retrace_elapsed = 0.0
+                    elif state != "TRAIL_RETRACE":
+                        state = "SPIN_SEARCH"
 
-                        if backtrack_intersection_wp is None:
-                            inter_wp = buffer.find_recent_intersection(
-                                now, max_age=INTERSECTION_MEMORY_MAX_AGE_S,
-                            )
-                            if inter_wp and buffer.has_untried_branches(inter_wp):
-                                branch_idx, branch = buffer.find_untried_branch(inter_wp)
-                                if branch is not None:
-                                    print("DEAD END: backtracking to last intersection "
-                                          f"and trying branch {branch_idx}")
-                                    backtrack_intersection_wp = inter_wp
-                                    backtrack_target_branch_idx = branch_idx
-                                    backtrack_start_time = now
-                                    rotate_settle_until = None
-                                    buffer.mark_chosen_branch_taken(inter_wp)
-                                    state = "BACKTRACK"
-                                    target_forward = 0.0
-                                    target_turn = 0.0
+                    if state == "TRAIL_RETRACE":
+                        retrace_elapsed += dt
+                        if retrace_sample is None or retrace_elapsed >= retrace_sample["dt"]:
+                            retrace_sample = pop_retrace_step(command_trail)
+                            retrace_elapsed = 0.0
+
+                        if retrace_sample is None:
+                            print("TRAIL RETRACE: no recent path history, falling back to spin search")
+                            state = "SPIN_SEARCH"
+                        else:
+                            target_forward = -retrace_sample["forward"]
+                            target_turn = -retrace_sample["turn"]
+
+                    if state == "SPIN_SEARCH":
+                        if spin_start_time is None:
+                            spin_start_time = now
+
+                        if now - spin_start_time < LINE_LOST_STOP_TIMEOUT_S:
+                            target_forward = 0.0
+                            target_turn = -SPIN_SEARCH_SPEED * search_direction
+                        else:
+                            # Dead end: try backtracking if we have intersection history
+                            if not dead_end_recorded:
+                                buffer.record_dead_end(frame=frame, state=state)
+                                dead_end_recorded = True
+
+                            if backtrack_intersection_wp is None:
+                                target_wp, hops = buffer.find_backtrack_target(
+                                    now, max_age=INTERSECTION_MEMORY_MAX_AGE_S,
+                                )
+                                if target_wp is not None:
+                                    branch_idx, branch = buffer.find_untried_branch(target_wp)
+                                    if branch is not None:
+                                        print(f"DEAD END: backtracking {hops + 1} intersection(s) back, "
+                                              f"trying branch {branch_idx}")
+                                        backtrack_intersection_wp = target_wp
+                                        backtrack_target_branch_idx = branch_idx
+                                        backtrack_pass_remaining = hops
+                                        awaiting_intersection_clear = False
+                                        backtrack_start_time = now
+                                        rotate_settle_until = None
+                                        buffer.mark_chosen_branch_taken(target_wp)
+                                        state = "BACKTRACK"
+                                        target_forward = 0.0
+                                        target_turn = 0.0
+                                    else:
+                                        target_forward = 0.0
+                                        target_turn = 0.0
                                 else:
+                                    print("DEAD END: no untried intersection branch found anywhere in memory")
+                                    state = "STOP"
+                                    backtrack_intersection_wp = None
+                                    backtrack_target_branch_idx = None
+                                    backtrack_pass_remaining = 0
+                                    awaiting_intersection_clear = False
                                     target_forward = 0.0
                                     target_turn = 0.0
                             else:
-                                print("DEAD END: no untried intersection branch found")
-                                state = "STOP"
                                 target_forward = 0.0
                                 target_turn = 0.0
-                        else:
-                            target_forward = 0.0
-                            target_turn = 0.0
 
             # ----- MARKER ACTION (unchanged) -----
             if pending_marker_color is not None and now >= pending_marker_action_time:
@@ -523,7 +623,6 @@ def main():
                     print("RED MARKER: stopping")
                     start_blink(red_led_state, blinks=None, interval_s=0.25, hold_on=True)
                     play_tone(buzzer_state, "marker_red")
-                    stop_motors(left_pwm, right_pwm)
                     halted = True
                 pending_marker_color = None
                 pending_marker_action_time = None
@@ -544,7 +643,7 @@ def main():
                     "APPROACH": "state_approach",
                     "FOLLOW": "state_follow",
                 }[state])
-            elif state != prev_state and state in ("BACKTRACK", "ROTATE"):
+            elif state != prev_state and state in ("BACKTRACK", "ROTATE", "TRAIL_RETRACE"):
                 play_tone(buzzer_state, "sharp_turn")
 
             is_sharp_turn = state == "FOLLOW" and abs(target_turn) > SHARP_TURN_SPEED * 0.6
@@ -556,38 +655,47 @@ def main():
             # ----- APPLY SPEEDS -----
             if state == "BACKTRACK":
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
-                turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
+                applied_turn = _apply_turn(applied_turn, target_turn, applied_forward, dt)
+                turn_component = applied_turn
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
                 set_speeds(applied_left, applied_right, left_pwm, right_pwm)
 
             elif state == "ROTATE":
                 applied_forward = 0.0
+                applied_turn = 0.0
                 turn_component = clamp(target_turn, -ROTATE_SPEED, ROTATE_SPEED)
                 applied_left = turn_component
                 applied_right = -turn_component
                 set_speeds(applied_left, applied_right, left_pwm, right_pwm)
 
             elif state == "STOP":
-                applied_forward = 0.0
-                turn_component = 0.0
-                applied_left = 0.0
-                applied_right = 0.0
-                stop_motors(left_pwm, right_pwm)
+                target_forward = 0.0
+                target_turn = 0.0
+                applied_forward = slew_toward(applied_forward, target_forward, max_step)
+                applied_turn = _apply_turn(applied_turn, target_turn, applied_forward, dt)
+                turn_component = applied_turn
+                applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
+                applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
+                set_speeds(applied_left, applied_right, left_pwm, right_pwm)
 
             elif state == "SPIN_SEARCH":
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
-                turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
+                applied_turn = _apply_turn(applied_turn, target_turn, applied_forward, dt)
+                turn_component = applied_turn
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
                 set_speeds(applied_left, applied_right, left_pwm, right_pwm)
 
             else:
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
-                turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
+                applied_turn = _apply_turn(applied_turn, target_turn, applied_forward, dt)
+                turn_component = applied_turn
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
                 set_speeds(applied_left, applied_right, left_pwm, right_pwm)
+                if state in ("FOLLOW", "APPROACH"):
+                    record_sample(command_trail, applied_forward, applied_turn, dt, now, TRAIL_MAX_AGE_S)
 
             # ----- LED / BUZZER UPDATES -----
             current_speed_mag = abs(applied_forward)
@@ -630,6 +738,9 @@ def main():
     except KeyboardInterrupt:
         print("stopping")
 
+    except CameraError as exc:
+        print(f"CAMERA FAILURE: {exc}")
+
     finally:
         stop_motors(left_pwm, right_pwm)
         left_pwm.stop()
@@ -638,10 +749,8 @@ def main():
         GPIO.output(GREEN_LED_PIN, GPIO.LOW)
         buzzer_pwm.stop()
         GPIO.cleanup()
-        if camera_kind == "picamera2":
-            camera.stop()
-        else:
-            camera.release()
+        camera.stop()
+        lookahead_pool.shutdown(wait=False, cancel_futures=True)
         if SHOW_DEBUG_VIEW:
             cv2.destroyAllWindows()
         print("cleaned up")

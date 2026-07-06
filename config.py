@@ -11,6 +11,22 @@ ADAPTIVE_KD_ERROR_BOOST = 0.35
 ADAPTIVE_KD_DERIVATIVE_BOOST = 0.55
 ADAPTIVE_KI_ERROR_REDUCTION = 0.70
 ADAPTIVE_DERIVATIVE_REF = 4.0
+
+# Chassis weight distribution (drive motors at front, passive caster at rear)
+FRONT_WEIGHT_RATIO = 0.70
+REAR_WEIGHT_RATIO = 0.30
+REAR_LAG_KD_GAIN = 0.50        # extra Kd damping during fast turn-rate changes
+TURN_SLEW_RATE_PER_S = 2.2     # max rate turn_component may change per second (yaw inertia)
+REAR_GRIP_SPEED_DERATE = 0.45  # how much max turn authority shrinks as forward speed rises
+MIN_TURN_AUTHORITY_SCALE = 0.55
+
+# Poke-out recovery: replay recent motor commands in reverse to retrace the line
+TRAIL_MAX_AGE_S = 3.0   # how much recent command history is kept / max retrace duration
+
+# Disable OpenCV's own internal thread pool so it doesn't oversubscribe against
+# the app's own capture/lookahead threads.
+CV2_NUM_THREADS = 1
+
 INTEGRAL_LIMIT = 1.2
 LOW_CONFIDENCE_SPEED_SCALE = 0.65
 ERROR_SPEED_REDUCTION = 0.55
@@ -45,8 +61,8 @@ ROI_Y_START_RATIO = 0.67
 ROI_Y_END_RATIO = 0.86
 ROI_X_START_RATIO = 0.05
 ROI_X_END_RATIO = 0.85
-LOOKAHEAD_ROI_Y_START_RATIO = 0.42
-LOOKAHEAD_ROI_Y_END_RATIO = 0.62
+LOOKAHEAD_ROI_Y_START_RATIO = 0.55
+LOOKAHEAD_ROI_Y_END_RATIO = 0.65
 LOOKAHEAD_ROI_X_START_RATIO = 0.05
 LOOKAHEAD_ROI_X_END_RATIO = 0.85
 WIDE_ROI_Y_START_RATIO = 0.20
