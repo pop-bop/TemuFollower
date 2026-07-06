@@ -11,19 +11,6 @@ ADAPTIVE_KD_ERROR_BOOST = 0.35
 ADAPTIVE_KD_DERIVATIVE_BOOST = 0.55
 ADAPTIVE_KI_ERROR_REDUCTION = 0.70
 ADAPTIVE_DERIVATIVE_REF = 4.0
-
-# Chassis weight distribution (drive motors at front, passive caster at rear)
-FRONT_WEIGHT_RATIO = 0.70
-REAR_WEIGHT_RATIO = 0.30
-REAR_LAG_KD_GAIN = 0.50        # extra Kd damping during fast turn-rate changes
-TURN_SLEW_RATE_PER_S = 2.2     # max rate turn_component may change per second (yaw inertia)
-REAR_GRIP_SPEED_DERATE = 0.45  # how much max turn authority shrinks as forward speed rises
-MIN_TURN_AUTHORITY_SCALE = 0.55
-
-# Disable OpenCV's own internal thread pool so it doesn't oversubscribe against
-# the app's own capture/lookahead threads.
-CV2_NUM_THREADS = 1
-
 INTEGRAL_LIMIT = 1.2
 LOW_CONFIDENCE_SPEED_SCALE = 0.65
 ERROR_SPEED_REDUCTION = 0.55
@@ -38,10 +25,6 @@ LOOKAHEAD_CONFIDENCE_MIN = 0.25
 RK4_TRAJECTORY_GAIN = 10.0
 RK4_HEADING_GAIN = 8.0
 RK4_MAX_DT = 0.05
-# Untested on hardware (crashed every time it ran until the lookahead_debug bug
-# was fixed). Set False to bypass RK4/curve-boost/lookahead-blend and drive on
-# raw normal_error, so you can confirm the base PID is stable before re-enabling.
-TRAJECTORY_PREDICTION_ENABLED = False
 
 # SPEEDS
 SHARP_TURN_SPEED = 0.50
@@ -62,8 +45,8 @@ ROI_Y_START_RATIO = 0.67
 ROI_Y_END_RATIO = 0.86
 ROI_X_START_RATIO = 0.05
 ROI_X_END_RATIO = 0.85
-LOOKAHEAD_ROI_Y_START_RATIO = 0.55
-LOOKAHEAD_ROI_Y_END_RATIO = 0.65
+LOOKAHEAD_ROI_Y_START_RATIO = 0.42
+LOOKAHEAD_ROI_Y_END_RATIO = 0.62
 LOOKAHEAD_ROI_X_START_RATIO = 0.05
 LOOKAHEAD_ROI_X_END_RATIO = 0.85
 WIDE_ROI_Y_START_RATIO = 0.20

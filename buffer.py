@@ -51,18 +51,6 @@ class TemporalBuffer:
                 return wp
         return None
 
-    def find_backtrack_target(self, now, max_age=INTERSECTION_MEMORY_MAX_AGE_S):
-        passed = 0
-        for wp in reversed(self.waypoints):
-            if not (wp.get("is_intersection") and wp.get("branches")):
-                continue
-            if now - wp["timestamp"] >= max_age:
-                break
-            if self.has_untried_branches(wp):
-                return wp, passed
-            passed += 1
-        return None, passed
-
     def find_untried_branch(self, intersection_wp):
         if intersection_wp is None:
             return None, None
