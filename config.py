@@ -26,6 +26,19 @@ RK4_TRAJECTORY_GAIN = 10.0
 RK4_HEADING_GAIN = 8.0
 RK4_MAX_DT = 0.05
 
+# Second RK4 layer: tracks curvature trend between the lookahead and far ROIs,
+# so a closing-out turn can be anticipated before the near ROI ever straightens.
+FAR_CONFIDENCE_MIN = 0.25
+RK4_CURVATURE_GAIN = 10.0
+RK4_CURVATURE_RATE_GAIN = 8.0
+CURVATURE_DAMPING = 0.6
+
+# Smooths the discrete error derivative before it feeds the PID/turn-boost math.
+# Raw frame-to-frame derivative of a noisy vision error is the classic cause of
+# oscillation ("swinging") on turns -- this trades a little responsiveness for
+# a lot less overshoot-correct-overshoot.
+DERIVATIVE_SMOOTHING = 0.4
+
 # SPEEDS
 SHARP_TURN_SPEED = 0.50
 MAX_TURN_SPEED = 0.65
@@ -49,6 +62,10 @@ LOOKAHEAD_ROI_Y_START_RATIO = 0.42
 LOOKAHEAD_ROI_Y_END_RATIO = 0.62
 LOOKAHEAD_ROI_X_START_RATIO = 0.05
 LOOKAHEAD_ROI_X_END_RATIO = 0.85
+FAR_ROI_Y_START_RATIO = 0.24
+FAR_ROI_Y_END_RATIO = 0.40
+FAR_ROI_X_START_RATIO = 0.05
+FAR_ROI_X_END_RATIO = 0.85
 WIDE_ROI_Y_START_RATIO = 0.20
 WIDE_ROI_X_START_RATIO = 0.0
 WIDE_ROI_X_END_RATIO = 1.0

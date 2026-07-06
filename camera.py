@@ -1,5 +1,3 @@
-import threading
-
 import cv2
 
 from config import CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, PICAMERA2_RGB_TO_BGR
@@ -43,32 +41,3 @@ def read_frame(camera_kind, camera):
     else:
         ok, frame = camera.read()
         return frame if ok else None
-
-
-class FrameGrabber:
-    """Reads frames on a background thread so the control loop never blocks
-    on camera I/O -- it just grabs whatever the latest frame is."""
-
-    def __init__(self, camera_kind, camera):
-        self.camera_kind = camera_kind
-        self.camera = camera
-        self._lock = threading.Lock()
-        self._frame = None
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self):
-        while self._running:
-            frame = read_frame(self.camera_kind, self.camera)
-            if frame is not None:
-                with self._lock:
-                    self._frame = frame
-
-    def get_latest(self):
-        with self._lock:
-            return self._frame
-
-    def stop(self):
-        self._running = False
-        self._thread.join(timeout=1.0)

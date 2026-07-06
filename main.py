@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import RPi.GPIO as GPIO
@@ -15,17 +14,18 @@ from config import (
     ERROR_SPEED_REDUCTION, DERIVATIVE_SPEED_REDUCTION, STRAIGHT_SPEED_BOOST,
     ADAPTIVE_DERIVATIVE_REF, CURVE_SPEED_REDUCTION, CURVE_TURN_BOOST,
     MIN_CURVE_SPEED_SCALE, NEAR_TRAJECTORY_WEIGHT, LOOKAHEAD_TRAJECTORY_WEIGHT,
-    LOOKAHEAD_CONFIDENCE_MIN, ACCEL_BUZZER_ENABLED, ACCEL_SPEED_DELTA_THRESHOLD,
+    LOOKAHEAD_CONFIDENCE_MIN, FAR_CONFIDENCE_MIN, CURVATURE_DAMPING,
+    DERIVATIVE_SMOOTHING, ACCEL_BUZZER_ENABLED, ACCEL_SPEED_DELTA_THRESHOLD,
     MARKER_ACTION_DELAY_S,
     RED_LED_PIN, GREEN_LED_PIN,
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
     INTERSECTION_COOLDOWN_S, INTERSECTION_MEMORY_MAX_AGE_S,
     MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO, ROTATE_SETTLE_TIME_S,
 )
-from camera import open_camera, FrameGrabber
+from camera import open_camera, read_frame
 from vision import (
-    find_line_error_normal, find_line_error_lookahead, find_line_error_wide,
-    print_calibration_info, detect_intersection_normal,
+    find_line_error_normal, find_line_error_lookahead, find_line_error_far,
+    find_line_error_wide, print_calibration_info, detect_intersection_normal,
 )
 from motors import setup_motors, set_speeds, slew_toward, stop_motors
 from indicators import (
@@ -36,20 +36,17 @@ from utils import clamp
 from debug_view import draw_debug_view, draw_roi_arrow_view
 from buffer import TemporalBuffer
 from adaptive_pid import schedule_pid_gains
-from trajectory import new_trajectory_state, reset_trajectory_state, rk4_step
+from trajectory import (
+    new_trajectory_state, reset_trajectory_state, rk4_step, rk4_step_curvature,
+)
 
 
 def main():
     camera_kind, camera = open_camera()
-    grabber = FrameGrabber(camera_kind, camera)
-    vision_executor = ThreadPoolExecutor(max_workers=2)
     left_pwm, right_pwm = setup_motors()
     buzzer_pwm = setup_indicators()
 
-    first_frame = None
-    first_frame_wait_start = time.perf_counter()
-    while first_frame is None and time.perf_counter() - first_frame_wait_start < 5.0:
-        first_frame = grabber.get_latest()
+    first_frame = read_frame(camera_kind, camera)
     if first_frame is not None:
         print_calibration_info(first_frame)
 
@@ -91,6 +88,8 @@ def main():
     current_ki = KI
     current_kd = KD
     trajectory_state = new_trajectory_state()
+    curvature_state = new_trajectory_state()
+    smoothed_derivative = 0.0
     curve_sharpness = 0.0
     curve_speed_scale = 1.0
     prev_speed_for_accel = 0.0
@@ -126,6 +125,8 @@ def main():
                     rotate_settle_until = None
                     dead_end_recorded = False
                     reset_trajectory_state(trajectory_state)
+                    reset_trajectory_state(curvature_state)
+                    smoothed_derivative = 0.0
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
                     prev_speed_for_accel = 0.0
@@ -147,6 +148,8 @@ def main():
                     dead_end_recorded = False
                     spin_start_time = None
                     reset_trajectory_state(trajectory_state)
+                    reset_trajectory_state(curvature_state)
+                    smoothed_derivative = 0.0
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
                     prev_speed_for_accel = 0.0
@@ -171,7 +174,7 @@ def main():
                     play_tone(buzzer_state, "manual_test")
                     print("BUZZER manual test tone")
 
-            frame = grabber.get_latest()
+            frame = read_frame(camera_kind, camera)
             if frame is None:
                 continue
 
@@ -233,10 +236,6 @@ def main():
                 continue
 
             # ===== AUTO MODE: VISION + STATE MACHINE =====
-            # Lookahead runs on a background thread in parallel with the normal
-            # ROI scan below -- they're independent cv2 passes over the same
-            # frame, so there's no reason to pay their cost sequentially.
-            lookahead_future = vision_executor.submit(find_line_error_lookahead, frame)
             normal_error, normal_debug = find_line_error_normal(frame)
 
             target_forward = 0.0
@@ -244,6 +243,7 @@ def main():
             display_turn = None
             active_debug = normal_debug
             lookahead_debug = None
+            far_debug = None
             curve_sharpness = 0.0
             curve_speed_scale = 1.0
 
@@ -347,6 +347,8 @@ def main():
                                 last_error = 0.0
                                 search_direction = 1.0
                                 reset_trajectory_state(trajectory_state)
+                                reset_trajectory_state(curvature_state)
+                                smoothed_derivative = 0.0
                                 state = "FOLLOW"
                             else:
                                 turn = clamp(branch_error * ROTATE_SPEED * 2, -ROTATE_SPEED, ROTATE_SPEED)
@@ -365,11 +367,18 @@ def main():
                 dead_end_recorded = False
 
                 # Look ahead above the normal ROI to anticipate curves before
-                # the near ROI reacts to them (computed concurrently above).
-                lookahead_error, lookahead_debug = lookahead_future.result()
+                # the near ROI reacts to them.
+                lookahead_error, lookahead_debug = find_line_error_lookahead(frame)
                 lookahead_confidence = lookahead_debug.get("line_confidence", 0.0)
+                lookahead_ok = lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN
 
-                if lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN:
+                # Third ROI, farther out still -- lets the robot see a curve
+                # closing back out before the lookahead ROI does.
+                far_error, far_debug = find_line_error_far(frame)
+                far_confidence = far_debug.get("line_confidence", 0.0)
+                far_ok = far_error is not None and far_confidence >= FAR_CONFIDENCE_MIN
+
+                if lookahead_ok:
                     curve = lookahead_error - normal_error
                     # Trust the look-ahead ROI more at speed and when already
                     # centered; fall back to the near ROI when off-center or
@@ -387,7 +396,30 @@ def main():
                 predicted_error, predicted_heading = rk4_step(
                     trajectory_state, trajectory_target_error, curve, dt,
                 )
+
+                # ----- Layer 2: curvature trend from the lookahead/far span -----
+                # far_curve is the curvature the near/lookahead layer will see a
+                # moment from now; comparing it against the current curve tells
+                # us whether the turn is tightening or closing back out.
+                far_curve = (far_error - lookahead_error) if (lookahead_ok and far_ok) else curve
+                curvature_rate_target = far_curve - curve
+                predicted_curvature, predicted_curvature_rate = rk4_step_curvature(
+                    curvature_state, far_curve, curvature_rate_target, dt,
+                )
+
                 curve_sharpness = clamp(abs(predicted_heading), 0.0, 1.0)
+                # If the curvature rate opposes the current heading, the turn is
+                # closing out -- damp the turn boost pre-emptively instead of
+                # waiting for the near ROI to straighten and overshooting the
+                # correction (a common cause of oscillation on exits).
+                closing_out = (predicted_curvature_rate * predicted_heading) < 0.0
+                curvature_damping = 1.0
+                if closing_out:
+                    curvature_damping = clamp(
+                        1.0 - CURVATURE_DAMPING * clamp(abs(predicted_curvature_rate), 0.0, 1.0),
+                        0.0, 1.0,
+                    )
+
                 curve_speed_scale = clamp(
                     1.0 - CURVE_SPEED_REDUCTION * curve_sharpness,
                     MIN_CURVE_SPEED_SCALE, 1.0,
@@ -396,7 +428,14 @@ def main():
                 error = predicted_error
                 integral += error * dt
                 integral = clamp(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
-                derivative = (error - last_error) / dt
+                raw_derivative = (error - last_error) / dt
+                # Smooth the derivative -- a raw frame-to-frame derivative of a
+                # noisy vision error is the classic driver of turn oscillation.
+                smoothed_derivative = (
+                    (1.0 - DERIVATIVE_SMOOTHING) * raw_derivative
+                    + DERIVATIVE_SMOOTHING * smoothed_derivative
+                )
+                derivative = smoothed_derivative
                 last_error = error
 
                 line_confidence = normal_debug.get("line_confidence", 1.0)
@@ -405,7 +444,7 @@ def main():
                 )
 
                 raw_turn = (current_kp * error) + (current_ki * integral) + (current_kd * derivative)
-                raw_turn *= 1.0 + CURVE_TURN_BOOST * curve_sharpness
+                raw_turn *= 1.0 + CURVE_TURN_BOOST * curve_sharpness * curvature_damping
                 raw_turn = clamp(raw_turn, -TURN_LIMIT, TURN_LIMIT)
                 display_turn = raw_turn
                 motor_turn = -raw_turn if STEER_INVERT else raw_turn
@@ -612,10 +651,15 @@ def main():
                 extra_lines = None
                 lookahead_bounds = None
                 lookahead_point = None
+                far_bounds = None
+                far_point = None
                 if state == "FOLLOW" and lookahead_debug is not None:
                     extra_lines = [f"curve={curve_sharpness:.2f} spd_scale={curve_speed_scale:.2f}"]
                     lookahead_bounds = lookahead_debug["roi_bounds"]
                     lookahead_point = lookahead_debug["line_point"]
+                    if far_debug is not None:
+                        far_bounds = far_debug["roi_bounds"]
+                        far_point = far_debug["line_point"]
                 draw_debug_view(
                     frame, active_debug,
                     normal_error if state == "FOLLOW" else None,
@@ -623,6 +667,8 @@ def main():
                     extra_lines=extra_lines,
                     lookahead_bounds=lookahead_bounds,
                     lookahead_point=lookahead_point,
+                    far_bounds=far_bounds,
+                    far_point=far_point,
                 )
                 lean_ratio = (display_turn / TURN_LIMIT) if display_turn is not None else None
                 draw_roi_arrow_view(active_debug, applied_left, applied_right, state, lean_ratio)
@@ -648,8 +694,6 @@ def main():
         GPIO.output(GREEN_LED_PIN, GPIO.LOW)
         buzzer_pwm.stop()
         GPIO.cleanup()
-        grabber.stop()
-        vision_executor.shutdown(wait=False)
         if camera_kind == "picamera2":
             camera.stop()
         else:
