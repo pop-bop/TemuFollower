@@ -45,7 +45,8 @@ def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_rati
         "line_point": None,
         "roi_frame": roi,
         "red_marker": False,
-        "green_marker": False,
+        # Green doesn't need to touch the line to count -- anywhere in the ROI is fine.
+        "green_marker": cv2.countNonZero(green_mask) >= MIN_MARKER_AREA,
         "line_area": 0.0,
         "line_confidence": 0.0,
     }
@@ -66,9 +67,7 @@ def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_rati
     near_line_zone = cv2.dilate(near_line_zone, np.ones((15, 15), np.uint8))
 
     red_hit = cv2.bitwise_and(near_line_zone, red_mask)
-    green_hit = cv2.bitwise_and(near_line_zone, green_mask)
     debug_info["red_marker"] = cv2.countNonZero(red_hit) >= MIN_MARKER_AREA
-    debug_info["green_marker"] = cv2.countNonZero(green_hit) >= MIN_MARKER_AREA
 
     M = cv2.moments(largest)
     if M["m00"] <= 0:
