@@ -1,0 +1,5 @@
+opencv-python
+numpy
+spidev
+pyrealsense2
+RPi.GPIO
