@@ -10,11 +10,38 @@ from config import (
     WIDE_ROI_Y_START_RATIO, WIDE_ROI_X_START_RATIO, WIDE_ROI_X_END_RATIO,
     BLACK_THRESHOLD, MIN_LINE_AREA, GREEN_DIFF_THRESHOLD, RED_DIFF_THRESHOLD,
     MIN_MARKER_AREA, INTERSECTION_MIN_AREA, INTERSECTION_MIN_CONTOURS,
+    WARP_MATRIX, GROUND_DEPTH_TOLERANCE_MM
 )
 from utils import clamp
 
+def get_warp_matrix():
+    return np.array(WARP_MATRIX, dtype=np.float32)
 
-def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_ratio):
+def warp_frame(frame, M):
+    h, w = frame.shape[:2]
+    return cv2.warpPerspective(frame, M, (w, h))
+
+def get_expected_depth_map(w, h, tilt_deg, height_mm):
+    expected = np.zeros((h, w), dtype=np.float32)
+    fov_y = 60.0 * np.pi / 180.0
+    tilt_rad = tilt_deg * np.pi / 180.0
+    for y in range(h):
+        ny = (y - h/2.0) / (h/2.0)
+        # Assuming origin is center of image, tilt down by tilt_rad
+        angle = tilt_rad - ny * (fov_y/2.0)
+        if angle <= 0.05: 
+            angle = 0.05
+        expected[y, :] = height_mm / np.sin(angle)
+    return expected
+
+def get_obstacle_mask(depth_frame, depth_scale, expected_map):
+    depth_mm = depth_frame * (depth_scale * 1000.0)
+    obs = (expected_map - depth_mm) > GROUND_DEPTH_TOLERANCE_MM
+    obs = obs & (depth_mm > 0)
+    return obs.astype(np.uint8) * 255
+
+
+def find_line_error(frame, obstacle_mask, y_start_ratio, y_end_ratio, x_start_ratio, x_end_ratio):
     h, w = frame.shape[:2]
     y0 = int(h * y_start_ratio)
     y1 = int(h * y_end_ratio)
@@ -23,10 +50,16 @@ def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_rati
     roi = frame[y0:y1, x0:x1]
     roi_w = x1 - x0
 
+    if obstacle_mask is not None:
+        obs_roi = obstacle_mask[y0:y1, x0:x1]
+    else:
+        obs_roi = np.zeros((y1-y0, roi_w), dtype=np.uint8)
+
     b, g, r = cv2.split(roi)
     _, gr = cv2.threshold(cv2.subtract(g, r), GREEN_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
     _, gb = cv2.threshold(cv2.subtract(g, b), GREEN_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
     green_mask = cv2.bitwise_and(gr, gb)
+    
     _, rg = cv2.threshold(cv2.subtract(r, g), RED_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
     _, rb = cv2.threshold(cv2.subtract(r, b), RED_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
     red_mask = cv2.bitwise_and(rg, rb)
@@ -37,6 +70,7 @@ def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_rati
 
     black_mask[green_mask > 0] = 0
     black_mask[red_mask > 0] = 0
+    black_mask[obs_roi > 0] = 0 # Reject blocks
 
     black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
@@ -47,10 +81,10 @@ def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_rati
         "line_point": None,
         "roi_frame": roi,
         "red_marker": False,
-        # Green doesn't need to touch the line to count -- anywhere in the ROI is fine.
         "green_marker": cv2.countNonZero(green_mask) >= MIN_MARKER_AREA,
         "line_area": 0.0,
         "line_confidence": 0.0,
+        "obstacle_detected": cv2.countNonZero(obs_roi) > 0
     }
 
     contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -69,7 +103,13 @@ def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_rati
     near_line_zone = cv2.dilate(near_line_zone, np.ones((15, 15), np.uint8))
 
     red_hit = cv2.bitwise_and(near_line_zone, red_mask)
-    debug_info["red_marker"] = cv2.countNonZero(red_hit) >= MIN_MARKER_AREA
+    red_marker = cv2.countNonZero(red_hit) >= MIN_MARKER_AREA
+    if red_marker:
+        red_hit_obs = cv2.bitwise_and(red_hit, obs_roi)
+        if cv2.countNonZero(red_hit_obs) > (MIN_MARKER_AREA / 2):
+            red_marker = False # It's a block, not a flat line marker
+            
+    debug_info["red_marker"] = red_marker
 
     M = cv2.moments(largest)
     if M["m00"] <= 0:
@@ -81,39 +121,50 @@ def find_line_error(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_rati
     cy_global = cy_roi + y0
     center_x_global = x0 + roi_w // 2
     error = (cx_global - center_x_global) / max(1.0, roi_w / 2.0)
+
+    # Obstacle avoidance: offset error to avoid blocks
+    if cv2.countNonZero(obs_roi) > 0:
+        obs_m = cv2.moments(obs_roi)
+        if obs_m["m00"] > 0:
+            obs_cx = int(obs_m["m10"] / obs_m["m00"])
+            if obs_cx > roi_w // 2:
+                error -= 0.6
+            else:
+                error += 0.6
+
     debug_info["line_point"] = (cx_global, cy_global)
     return clamp(error, -1.0, 1.0), debug_info
 
 
-def find_line_error_normal(frame):
+def find_line_error_normal(frame, obstacle_mask=None):
     return find_line_error(
-        frame, ROI_Y_START_RATIO, ROI_Y_END_RATIO,
+        frame, obstacle_mask, ROI_Y_START_RATIO, ROI_Y_END_RATIO,
         ROI_X_START_RATIO, ROI_X_END_RATIO,
     )
 
 
-def find_line_error_lookahead(frame):
+def find_line_error_lookahead(frame, obstacle_mask=None):
     return find_line_error(
-        frame, LOOKAHEAD_ROI_Y_START_RATIO, LOOKAHEAD_ROI_Y_END_RATIO,
+        frame, obstacle_mask, LOOKAHEAD_ROI_Y_START_RATIO, LOOKAHEAD_ROI_Y_END_RATIO,
         LOOKAHEAD_ROI_X_START_RATIO, LOOKAHEAD_ROI_X_END_RATIO,
     )
 
 
-def find_line_error_far(frame):
+def find_line_error_far(frame, obstacle_mask=None):
     return find_line_error(
-        frame, FAR_ROI_Y_START_RATIO, FAR_ROI_Y_END_RATIO,
+        frame, obstacle_mask, FAR_ROI_Y_START_RATIO, FAR_ROI_Y_END_RATIO,
         FAR_ROI_X_START_RATIO, FAR_ROI_X_END_RATIO,
     )
 
 
-def find_line_error_wide(frame):
+def find_line_error_wide(frame, obstacle_mask=None):
     return find_line_error(
-        frame, WIDE_ROI_Y_START_RATIO, 1.0,
+        frame, obstacle_mask, WIDE_ROI_Y_START_RATIO, 1.0,
         WIDE_ROI_X_START_RATIO, WIDE_ROI_X_END_RATIO,
     )
 
 
-def detect_intersection(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_ratio):
+def detect_intersection(frame, obstacle_mask, y_start_ratio, y_end_ratio, x_start_ratio, x_end_ratio):
     h, w = frame.shape[:2]
     y0 = int(h * y_start_ratio)
     y1 = int(h * y_end_ratio)
@@ -122,6 +173,11 @@ def detect_intersection(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_
     roi = frame[y0:y1, x0:x1]
     roi_w = x1 - x0
     roi_center_x = x0 + roi_w // 2
+
+    if obstacle_mask is not None:
+        obs_roi = obstacle_mask[y0:y1, x0:x1]
+    else:
+        obs_roi = np.zeros((y1-y0, roi_w), dtype=np.uint8)
 
     b, g, r = cv2.split(roi)
     _, gr = cv2.threshold(cv2.subtract(g, r), GREEN_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
@@ -137,6 +193,7 @@ def detect_intersection(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_
 
     mask[green_mask > 0] = 0
     mask[red_mask > 0] = 0
+    mask[obs_roi > 0] = 0
 
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
@@ -174,9 +231,9 @@ def detect_intersection(frame, y_start_ratio, y_end_ratio, x_start_ratio, x_end_
     }
 
 
-def detect_intersection_normal(frame):
+def detect_intersection_normal(frame, obstacle_mask=None):
     return detect_intersection(
-        frame, ROI_Y_START_RATIO, ROI_Y_END_RATIO,
+        frame, obstacle_mask, ROI_Y_START_RATIO, ROI_Y_END_RATIO,
         ROI_X_START_RATIO, ROI_X_END_RATIO,
     )
 

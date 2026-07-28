@@ -57,3 +57,21 @@ def rk4_step_curvature(state, target_curvature, target_curvature_rate, dt):
 def reset_trajectory_state(state, error=0.0, heading=0.0):
     state["error"] = clamp(error, -1.0, 1.0)
     state["heading"] = clamp(heading, -1.0, 1.0)
+
+
+def generate_waypoints(state, target_error, curve, target_forward, dt=0.2, num=5, kp=1.1, steer_invert=True):
+    waypoints = []
+    sim_state = {"error": state["error"], "heading": state["heading"]}
+    
+    for _ in range(num):
+        err, heading = rk4_step(sim_state, target_error, curve, dt)
+        raw_turn = kp * err + 0.1 * heading
+        raw_turn = clamp(raw_turn, -0.8, 0.8)
+        motor_turn = -raw_turn if steer_invert else raw_turn
+        
+        turn_int = int(motor_turn * 127.0)
+        fwd_int = int(target_forward * 127.0)
+        
+        waypoints.append((turn_int, fwd_int))
+        
+    return waypoints

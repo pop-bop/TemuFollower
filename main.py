@@ -2,7 +2,6 @@
 import time
 
 import cv2
-import RPi.GPIO as GPIO
 
 from config import (
     KP, KI, KD, TURN_LIMIT, CENTER_DEADZONE,
@@ -17,7 +16,6 @@ from config import (
     LOOKAHEAD_CONFIDENCE_MIN, FAR_CONFIDENCE_MIN, CURVATURE_DAMPING,
     DERIVATIVE_SMOOTHING, ACCEL_BUZZER_ENABLED, ACCEL_SPEED_DELTA_THRESHOLD,
     MARKER_ACTION_DELAY_S,
-    RED_LED_PIN, GREEN_LED_PIN,
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
     INTERSECTION_COOLDOWN_S, INTERSECTION_MEMORY_MAX_AGE_S,
     MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO, ROTATE_SETTLE_TIME_S,
@@ -27,11 +25,15 @@ from vision import (
     find_line_error_normal, find_line_error_lookahead, find_line_error_far,
     find_line_error_wide, print_calibration_info, detect_intersection_normal,
 )
-from motors import setup_motors, set_speeds, slew_toward, stop_motors
-from indicators import (
-    setup_indicators, new_led_state, start_blink, update_led,
-    new_buzzer_state, play_tone, update_buzzer,
-)
+from spi import SPIController, pack_movement, pack_interrupt, pack_speciality
+from vision import get_warp_matrix, warp_frame, get_expected_depth_map, get_obstacle_mask
+from camera import get_depth_scale
+from config import CAMERA_TILT_ANGLE_DEG, CAMERA_MOUNT_HEIGHT_MM, SPI_BUS, SPI_DEVICE, SPI_MAX_SPEED_HZ
+
+def slew_toward(current, target, max_step):
+    if target > current: return min(target, current + max_step)
+    if target < current: return max(target, current - max_step)
+    return current
 from utils import clamp
 from debug_view import draw_debug_view, draw_roi_arrow_view
 from buffer import TemporalBuffer
@@ -43,12 +45,17 @@ from trajectory import (
 
 def main():
     camera_kind, camera = open_camera()
-    left_pwm, right_pwm = setup_motors()
-    buzzer_pwm = setup_indicators()
+    depth_scale = get_depth_scale(camera)
+    spi = SPIController(bus=SPI_BUS, device=SPI_DEVICE, max_speed_hz=SPI_MAX_SPEED_HZ)
+    warp_M = get_warp_matrix()
+    expected_depth_map = None
 
-    first_frame = read_frame(camera_kind, camera)
-    if first_frame is not None:
-        print_calibration_info(first_frame)
+    first_color, first_depth = read_frame(camera_kind, camera)
+    if first_color is not None:
+        h, w = first_color.shape[:2]
+        expected_depth_map = get_expected_depth_map(w, h, CAMERA_TILT_ANGLE_DEG, CAMERA_MOUNT_HEIGHT_MM)
+        warped = warp_frame(first_color, warp_M)
+        print_calibration_info(warped)
 
     integral = 0.0
     last_error = 0.0
@@ -61,9 +68,6 @@ def main():
     last_manual_key_time = time.perf_counter()
     last_manual_command = None
 
-    red_led_state = new_led_state()
-    green_led_state = new_led_state()
-    buzzer_state = new_buzzer_state()
     prev_state = None
     prev_sharp_turn = False
     prev_red_marker = False
@@ -71,9 +75,6 @@ def main():
     pending_marker_color = None
     pending_marker_action_time = None
     halted = False
-    red_led_manual = False
-    green_led_manual = False
-
     buffer = TemporalBuffer(max_size=MAX_WAYPOINTS)
     backtrack_intersection_wp = None
     backtrack_target_branch_idx = None
@@ -130,7 +131,7 @@ def main():
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
                     prev_speed_for_accel = 0.0
-                    stop_motors(left_pwm, right_pwm)
+                    spi.transmit(pack_interrupt())
                 elif key in (13, 10):
                     if mode != "AUTO":
                         print("SWITCHED TO AUTO: resuming line following")
@@ -153,7 +154,7 @@ def main():
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
                     prev_speed_for_accel = 0.0
-                    stop_motors(left_pwm, right_pwm)
+                    spi.transmit(pack_interrupt())
                     if halted:
                         print("MANUAL OVERRIDE: clearing red-marker halt")
                     halted = False
@@ -161,29 +162,29 @@ def main():
                     last_manual_key_time = now
                     last_manual_command = key
                 elif key == ord("r"):
-                    red_led_state["active"] = False
-                    red_led_manual = not red_led_manual
-                    GPIO.output(RED_LED_PIN, GPIO.HIGH if red_led_manual else GPIO.LOW)
-                    print(f"RED LED manual: {'ON' if red_led_manual else 'OFF'}")
+                    spi.transmit(pack_speciality(1))
+                    print("RED LED SPI trigger (0.5s)")
                 elif key == ord("g"):
-                    green_led_state["active"] = False
-                    green_led_manual = not green_led_manual
-                    GPIO.output(GREEN_LED_PIN, GPIO.HIGH if green_led_manual else GPIO.LOW)
-                    print(f"GREEN LED manual: {'ON' if green_led_manual else 'OFF'}")
+                    spi.transmit(pack_speciality(0))
+                    print("GREEN LED SPI trigger (0.5s)")
                 elif key == ord("b"):
-                    play_tone(buzzer_state, "manual_test")
+                    spi.transmit(pack_speciality(2))
                     print("BUZZER manual test tone")
 
-            frame = read_frame(camera_kind, camera)
-            if frame is None:
+            color_frame, depth_frame = read_frame(camera_kind, camera)
+            if color_frame is None:
                 continue
 
+            frame = warp_frame(color_frame, warp_M)
+            if expected_depth_map is not None and depth_frame is not None:
+                warped_depth = warp_frame(depth_frame, warp_M)
+                obstacle_mask = get_obstacle_mask(warped_depth, depth_scale, expected_depth_map)
+            else:
+                obstacle_mask = None
+
             if halted:
-                stop_motors(left_pwm, right_pwm)
+                spi.transmit(pack_interrupt())
                 prev_speed_for_accel = 0.0
-                update_led(red_led_state, RED_LED_PIN, now)
-                update_led(green_led_state, GREEN_LED_PIN, now)
-                update_buzzer(buzzer_state, buzzer_pwm, now, False)
                 if SHOW_DEBUG_VIEW:
                     cv2.imshow("Camera + Decisions", frame)
                 continue
@@ -214,18 +215,20 @@ def main():
                 turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
-                set_speeds(applied_left, applied_right, left_pwm, right_pwm)
+                
+                turn_int = int(turn_component * 127.0)
+                fwd_int = int(applied_forward * 127.0)
+                spi.transmit(pack_movement([(turn_int, fwd_int)] * 5))
 
                 current_speed_mag = abs(applied_forward)
                 accelerating = ACCEL_BUZZER_ENABLED and current_speed_mag > prev_speed_for_accel + ACCEL_SPEED_DELTA_THRESHOLD
                 prev_speed_for_accel = current_speed_mag
 
-                update_led(red_led_state, RED_LED_PIN, now)
-                update_led(green_led_state, GREEN_LED_PIN, now)
-                update_buzzer(buzzer_state, buzzer_pwm, now, accelerating)
+                if accelerating:
+                    spi.transmit(pack_speciality(2))
                 prev_state = state
 
-                _, active_debug = find_line_error_normal(frame)
+                _, active_debug = find_line_error_normal(frame, obstacle_mask)
                 if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
                     draw_debug_view(frame, active_debug, None, None, applied_left, applied_right, state)
                     draw_roi_arrow_view(active_debug, applied_left, applied_right, state)
@@ -236,7 +239,7 @@ def main():
                 continue
 
             # ===== AUTO MODE: VISION + STATE MACHINE =====
-            normal_error, normal_debug = find_line_error_normal(frame)
+            normal_error, normal_debug = find_line_error_normal(frame, obstacle_mask)
 
             target_forward = 0.0
             target_turn = 0.0
@@ -252,7 +255,7 @@ def main():
                     and normal_error is not None
                     and abs(normal_error) < CENTER_DEADZONE * 2):
                 if now - last_intersection_time > INTERSECTION_COOLDOWN_S:
-                    intersection = detect_intersection_normal(frame)
+                    intersection = detect_intersection_normal(frame, obstacle_mask)
                     if intersection:
                         inter_wp = buffer.record(
                             frame=frame, state=state, error=normal_error,
@@ -266,13 +269,13 @@ def main():
 
             # ----- BACKTRACK: reverse along the line to reach last intersection -----
             if state == "BACKTRACK":
-                backtrack_err, backtrack_debug = find_line_error_normal(frame)
+                backtrack_err, backtrack_debug = find_line_error_normal(frame, obstacle_mask)
                 active_debug = backtrack_debug
 
-                inter = detect_intersection_normal(frame)
+                inter = detect_intersection_normal(frame, obstacle_mask)
                 if inter:
                     print(f"BACKTRACK: reached intersection ({inter['branch_count']} branches)")
-                    stop_motors(left_pwm, right_pwm)
+                    spi.transmit(pack_interrupt())
                     backtrack_start_time = None
                     rotate_settle_until = now + ROTATE_SETTLE_TIME_S
                     state = "ROTATE"
@@ -287,7 +290,7 @@ def main():
                     target_forward = -BACKTRACK_SPEED
                     target_turn = motor_turn
                 else:
-                    wide_err, wide_debug = find_line_error_wide(frame)
+                    wide_err, wide_debug = find_line_error_wide(frame, obstacle_mask)
                     active_debug = wide_debug
                     if wide_err is not None:
                         raw_turn = clamp(KP * wide_err, -TURN_LIMIT, TURN_LIMIT)
@@ -298,7 +301,7 @@ def main():
                     else:
                         if backtrack_start_time and now - backtrack_start_time > BACKTRACK_SEARCH_TIMEOUT_S:
                             print("BACKTRACK FAILED: intersection not found")
-                            stop_motors(left_pwm, right_pwm)
+                            spi.transmit(pack_interrupt())
                             state = "STOP"
                         else:
                             target_forward = 0.0
@@ -327,7 +330,7 @@ def main():
                         rotate_settle_until = None
                         state = "STOP"
                     else:
-                        inter = detect_intersection_normal(frame)
+                        inter = detect_intersection_normal(frame, obstacle_mask)
                         if inter and backtrack_target_branch_idx is not None and backtrack_target_branch_idx < len(inter["branches"]):
                             target_branch = inter["branches"][backtrack_target_branch_idx]
                             roi_w = frame.shape[1] * (ROI_X_END_RATIO - ROI_X_START_RATIO)
@@ -368,13 +371,13 @@ def main():
 
                 # Look ahead above the normal ROI to anticipate curves before
                 # the near ROI reacts to them.
-                lookahead_error, lookahead_debug = find_line_error_lookahead(frame)
+                lookahead_error, lookahead_debug = find_line_error_lookahead(frame, obstacle_mask)
                 lookahead_confidence = lookahead_debug.get("line_confidence", 0.0)
                 lookahead_ok = lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN
 
                 # Third ROI, farther out still -- lets the robot see a curve
                 # closing back out before the lookahead ROI does.
-                far_error, far_debug = find_line_error_far(frame)
+                far_error, far_debug = find_line_error_far(frame, obstacle_mask)
                 far_confidence = far_debug.get("line_confidence", 0.0)
                 far_ok = far_error is not None and far_confidence >= FAR_CONFIDENCE_MIN
 
@@ -503,7 +506,7 @@ def main():
                 prev_green_marker = False
                 prev_red_marker = False
 
-                wide_error, wide_debug = find_line_error_wide(frame)
+                wide_error, wide_debug = find_line_error_wide(frame, obstacle_mask)
 
                 if wide_error is not None:
                     state = "APPROACH"
@@ -562,90 +565,57 @@ def main():
                             target_forward = 0.0
                             target_turn = 0.0
 
-            # ----- MARKER ACTION (unchanged) -----
             if pending_marker_color is not None and now >= pending_marker_action_time:
                 if pending_marker_color == "green":
                     print("GREEN MARKER: continuing")
-                    start_blink(green_led_state, blinks=4, interval_s=0.12)
-                    play_tone(buzzer_state, "marker_green")
+                    spi.transmit(pack_speciality(0)) # 00
                 elif pending_marker_color == "red":
                     print("RED MARKER: stopping")
-                    start_blink(red_led_state, blinks=None, interval_s=0.25, hold_on=True)
-                    play_tone(buzzer_state, "marker_red")
-                    stop_motors(left_pwm, right_pwm)
+                    spi.transmit(pack_speciality(1)) # 01
+                    spi.transmit(pack_interrupt())
                     halted = True
                 pending_marker_color = None
                 pending_marker_action_time = None
+
 
             if halted:
                 if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
                     cv2.imshow("Camera + Decisions", frame)
                 prev_speed_for_accel = 0.0
-                update_led(red_led_state, RED_LED_PIN, now)
-                update_led(green_led_state, GREEN_LED_PIN, now)
-                update_buzzer(buzzer_state, buzzer_pwm, now, False)
                 continue
 
-            # ----- STATE TRANSITION SOUNDS (unchanged) -----
-            if state != prev_state and state in ("SPIN_SEARCH", "APPROACH", "FOLLOW"):
-                play_tone(buzzer_state, {
-                    "SPIN_SEARCH": "state_spin_search",
-                    "APPROACH": "state_approach",
-                    "FOLLOW": "state_follow",
-                }[state])
-            elif state != prev_state and state in ("BACKTRACK", "ROTATE"):
-                play_tone(buzzer_state, "sharp_turn")
+            # ----- STATE TRANSITION SOUNDS -----
+            if state != prev_state and state in ("SPIN_SEARCH", "APPROACH", "FOLLOW", "BACKTRACK", "ROTATE"):
+                spi.transmit(pack_speciality(2)) # 10 = buzzer
 
-            is_sharp_turn = state == "FOLLOW" and abs(target_turn) > SHARP_TURN_SPEED * 0.6
-            if is_sharp_turn and not prev_sharp_turn:
-                play_tone(buzzer_state, "sharp_turn")
-            prev_state = state
-            prev_sharp_turn = is_sharp_turn
 
-            # ----- APPLY SPEEDS -----
-            if state == "BACKTRACK":
-                applied_forward = slew_toward(applied_forward, target_forward, max_step)
-                turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
-                applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
-                applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
-                set_speeds(applied_left, applied_right, left_pwm, right_pwm)
-
-            elif state == "ROTATE":
+            # ----- SPI WAYPOINT GENERATION & TRANSMIT -----
+            from trajectory import generate_waypoints
+            
+            if state == "STOP":
+                spi.transmit(pack_interrupt())
                 applied_forward = 0.0
-                turn_component = clamp(target_turn, -ROTATE_SPEED, ROTATE_SPEED)
-                applied_left = turn_component
-                applied_right = -turn_component
-                set_speeds(applied_left, applied_right, left_pwm, right_pwm)
-
-            elif state == "STOP":
-                applied_forward = 0.0
-                turn_component = 0.0
                 applied_left = 0.0
                 applied_right = 0.0
-                stop_motors(left_pwm, right_pwm)
-
-            elif state == "SPIN_SEARCH":
-                applied_forward = slew_toward(applied_forward, target_forward, max_step)
-                turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
-                applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
-                applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
-                set_speeds(applied_left, applied_right, left_pwm, right_pwm)
-
+                display_turn = 0.0
             else:
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
+                
+                # Generate 5 waypoints looking ahead 1.0s (0.2s each)
+                # Curve and target_error should be updated.
+                waypoints = generate_waypoints(
+                    trajectory_state, 
+                    normal_error if normal_error is not None else 0.0,
+                    curve_sharpness if 'curve_sharpness' in locals() else 0.0,
+                    applied_forward, 
+                    dt=0.2, num=5, kp=current_kp, steer_invert=STEER_INVERT
+                )
+                spi.transmit(pack_movement(waypoints))
+                
+                # Update visual variables for debug UI
                 turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
-                set_speeds(applied_left, applied_right, left_pwm, right_pwm)
-
-            # ----- LED / BUZZER UPDATES -----
-            current_speed_mag = abs(applied_forward)
-            accelerating = ACCEL_BUZZER_ENABLED and current_speed_mag > prev_speed_for_accel + ACCEL_SPEED_DELTA_THRESHOLD
-            prev_speed_for_accel = current_speed_mag
-
-            update_led(red_led_state, RED_LED_PIN, now)
-            update_led(green_led_state, GREEN_LED_PIN, now)
-            update_buzzer(buzzer_state, buzzer_pwm, now, accelerating)
 
             if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
                 extra_lines = None
@@ -655,11 +625,11 @@ def main():
                 far_point = None
                 if state == "FOLLOW" and lookahead_debug is not None:
                     extra_lines = [f"curve={curve_sharpness:.2f} spd_scale={curve_speed_scale:.2f}"]
-                    lookahead_bounds = lookahead_debug["roi_bounds"]
-                    lookahead_point = lookahead_debug["line_point"]
+                    lookahead_bounds = lookahead_debug.get("roi_bounds")
+                    lookahead_point = lookahead_debug.get("line_point")
                     if far_debug is not None:
-                        far_bounds = far_debug["roi_bounds"]
-                        far_point = far_debug["line_point"]
+                        far_bounds = far_debug.get("roi_bounds")
+                        far_point = far_debug.get("line_point")
                 draw_debug_view(
                     frame, active_debug,
                     normal_error if state == "FOLLOW" else None,
@@ -682,25 +652,21 @@ def main():
                     f"fps={fps_ema:.1f} pid={current_kp:.2f}/{current_ki:.2f}/{current_kd:.2f} "
                     f"curve={curve_sharpness:.2f}/{curve_speed_scale:.2f}"
                 )
-
     except KeyboardInterrupt:
         print("stopping")
 
     finally:
-        stop_motors(left_pwm, right_pwm)
-        left_pwm.stop()
-        right_pwm.stop()
-        GPIO.output(RED_LED_PIN, GPIO.LOW)
-        GPIO.output(GREEN_LED_PIN, GPIO.LOW)
-        buzzer_pwm.stop()
-        GPIO.cleanup()
+        spi.transmit(pack_interrupt())
         if camera_kind == "picamera2":
             camera.stop()
+        elif camera_kind == "realsense":
+            camera[0].stop()
         else:
-            camera.release()
+            if hasattr(camera, 'release'): camera.release()
         if SHOW_DEBUG_VIEW:
             cv2.destroyAllWindows()
         print("cleaned up")
+
 
 
 if __name__ == "__main__":

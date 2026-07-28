@@ -123,3 +123,21 @@ DEBUG_VIEW_EVERY_N_FRAMES = 2
 LOOP_LOG_INTERVAL_S = 0.20
 ROI_VIEW_SCALE = 3
 ARROW_MAX_DEFLECTION_DEG = 65.0
+
+# RealSense & Perspective Configs
+CAMERA_TILT_ANGLE_DEG = 25.0
+CAMERA_MOUNT_HEIGHT_MM = 150.0
+
+WARP_MATRIX = [
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0]
+]
+
+# Obstacle Detection
+GROUND_DEPTH_TOLERANCE_MM = 40.0 # Anything closer by this amount is an obstacle
+
+# SPI Configuration
+SPI_BUS = 0
+SPI_DEVICE = 0
+SPI_MAX_SPEED_HZ = 1000000
