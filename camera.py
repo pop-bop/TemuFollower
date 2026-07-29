@@ -18,7 +18,13 @@ def open_camera():
     config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
     config.enable_stream(rs.stream.depth, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.z16, CAMERA_FPS)
     
-    profile = pipeline.start(config)
+    try:
+        profile = pipeline.start(config)
+    except RuntimeError as e:
+        print(f"Requested configuration ({CAMERA_WIDTH}x{CAMERA_HEIGHT} @ {CAMERA_FPS} FPS) not supported: {e}")
+        print("Falling back to default camera configuration.")
+        # If the specific config fails, start with the default camera config
+        profile = pipeline.start()
     align_to = rs.stream.color
     align = rs.align(align_to)
     

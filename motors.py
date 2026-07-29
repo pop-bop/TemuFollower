@@ -13,13 +13,17 @@ class RobotMotors:
         left = clamp(left, -1.0, 1.0)
         right = clamp(right, -1.0, 1.0)
 
+        # Hardware mapping: right motor is mirrored, so invert its direction
+        # so that positive 'right' means forward movement.
+        actual_right_dir = -right
+
         left_duty = int(abs(left) * 255.0)
         right_duty = int(abs(right) * 255.0)
 
         dir_mask = 0
         if left < 0:
             dir_mask |= DIR_LEFT_REVERSE
-        if right < 0:
+        if actual_right_dir < 0:
             dir_mask |= DIR_RIGHT_REVERSE
 
         self.uart.set_motors(left_duty, right_duty, dir_mask)
