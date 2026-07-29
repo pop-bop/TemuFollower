@@ -25,10 +25,11 @@ from vision import (
     find_line_error_normal, find_line_error_lookahead, find_line_error_far,
     find_line_error_wide, print_calibration_info, detect_intersection_normal,
 )
-from spi import SPIController, pack_movement, pack_interrupt, pack_speciality
+from uart_master import UARTMaster
+from motors import RobotMotors
 from vision import get_warp_matrix, warp_frame, get_expected_depth_map, get_obstacle_mask
 from camera import get_depth_scale
-from config import CAMERA_TILT_ANGLE_DEG, CAMERA_MOUNT_HEIGHT_MM, SPI_BUS, SPI_DEVICE, SPI_MAX_SPEED_HZ
+from config import CAMERA_TILT_ANGLE_DEG, CAMERA_MOUNT_HEIGHT_MM
 
 def slew_toward(current, target, max_step):
     if target > current: return min(target, current + max_step)
@@ -46,7 +47,8 @@ from trajectory import (
 def main():
     camera_kind, camera = open_camera()
     depth_scale = get_depth_scale(camera)
-    spi = SPIController(bus=SPI_BUS, device=SPI_DEVICE, max_speed_hz=SPI_MAX_SPEED_HZ)
+    uart = UARTMaster()
+    motors = RobotMotors(uart)
     warp_M = get_warp_matrix()
     expected_depth_map = None
 
@@ -131,7 +133,7 @@ def main():
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
                     prev_speed_for_accel = 0.0
-                    spi.transmit(pack_interrupt())
+                    motors.stop()
                 elif key in (13, 10):
                     if mode != "AUTO":
                         print("SWITCHED TO AUTO: resuming line following")
@@ -154,7 +156,7 @@ def main():
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
                     prev_speed_for_accel = 0.0
-                    spi.transmit(pack_interrupt())
+                    motors.stop()
                     if halted:
                         print("MANUAL OVERRIDE: clearing red-marker halt")
                     halted = False
@@ -162,13 +164,13 @@ def main():
                     last_manual_key_time = now
                     last_manual_command = key
                 elif key == ord("r"):
-                    spi.transmit(pack_speciality(1))
+                    pass
                     print("RED LED SPI trigger (0.5s)")
                 elif key == ord("g"):
-                    spi.transmit(pack_speciality(0))
+                    pass
                     print("GREEN LED SPI trigger (0.5s)")
                 elif key == ord("b"):
-                    spi.transmit(pack_speciality(2))
+                    pass
                     print("BUZZER manual test tone")
 
             color_frame, depth_frame = read_frame(camera_kind, camera)
@@ -183,7 +185,7 @@ def main():
                 obstacle_mask = None
 
             if halted:
-                spi.transmit(pack_interrupt())
+                motors.stop()
                 prev_speed_for_accel = 0.0
                 if SHOW_DEBUG_VIEW:
                     cv2.imshow("Camera + Decisions", frame)
@@ -216,16 +218,14 @@ def main():
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
                 
-                turn_int = int(turn_component * 127.0)
-                fwd_int = int(applied_forward * 127.0)
-                spi.transmit(pack_movement([(turn_int, fwd_int)] * 5))
+                motors.set_speeds(applied_left, applied_right)
 
                 current_speed_mag = abs(applied_forward)
                 accelerating = ACCEL_BUZZER_ENABLED and current_speed_mag > prev_speed_for_accel + ACCEL_SPEED_DELTA_THRESHOLD
                 prev_speed_for_accel = current_speed_mag
 
                 if accelerating:
-                    spi.transmit(pack_speciality(2))
+                    pass
                 prev_state = state
 
                 _, active_debug = find_line_error_normal(frame, obstacle_mask)
@@ -275,7 +275,7 @@ def main():
                 inter = detect_intersection_normal(frame, obstacle_mask)
                 if inter:
                     print(f"BACKTRACK: reached intersection ({inter['branch_count']} branches)")
-                    spi.transmit(pack_interrupt())
+                    motors.stop()
                     backtrack_start_time = None
                     rotate_settle_until = now + ROTATE_SETTLE_TIME_S
                     state = "ROTATE"
@@ -301,7 +301,7 @@ def main():
                     else:
                         if backtrack_start_time and now - backtrack_start_time > BACKTRACK_SEARCH_TIMEOUT_S:
                             print("BACKTRACK FAILED: intersection not found")
-                            spi.transmit(pack_interrupt())
+                            motors.stop()
                             state = "STOP"
                         else:
                             target_forward = 0.0
@@ -568,11 +568,11 @@ def main():
             if pending_marker_color is not None and now >= pending_marker_action_time:
                 if pending_marker_color == "green":
                     print("GREEN MARKER: continuing")
-                    spi.transmit(pack_speciality(0)) # 00
+                    pass
                 elif pending_marker_color == "red":
                     print("RED MARKER: stopping")
-                    spi.transmit(pack_speciality(1)) # 01
-                    spi.transmit(pack_interrupt())
+                    pass
+                    motors.stop()
                     halted = True
                 pending_marker_color = None
                 pending_marker_action_time = None
@@ -586,14 +586,12 @@ def main():
 
             # ----- STATE TRANSITION SOUNDS -----
             if state != prev_state and state in ("SPIN_SEARCH", "APPROACH", "FOLLOW", "BACKTRACK", "ROTATE"):
-                spi.transmit(pack_speciality(2)) # 10 = buzzer
+                pass
 
 
-            # ----- SPI WAYPOINT GENERATION & TRANSMIT -----
-            from trajectory import generate_waypoints
-            
+            # ----- MOTOR SPEED GENERATION & TRANSMIT -----
             if state == "STOP":
-                spi.transmit(pack_interrupt())
+                motors.stop()
                 applied_forward = 0.0
                 applied_left = 0.0
                 applied_right = 0.0
@@ -601,21 +599,11 @@ def main():
             else:
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
                 
-                # Generate 5 waypoints looking ahead 1.0s (0.2s each)
-                # Curve and target_error should be updated.
-                waypoints = generate_waypoints(
-                    trajectory_state, 
-                    normal_error if normal_error is not None else 0.0,
-                    curve_sharpness if 'curve_sharpness' in locals() else 0.0,
-                    applied_forward, 
-                    dt=0.2, num=5, kp=current_kp, steer_invert=STEER_INVERT
-                )
-                spi.transmit(pack_movement(waypoints))
-                
                 # Update visual variables for debug UI
                 turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
+                motors.set_speeds(applied_left, applied_right)
 
             if SHOW_DEBUG_VIEW and frame_count % DEBUG_VIEW_EVERY_N_FRAMES == 0:
                 extra_lines = None
@@ -656,7 +644,8 @@ def main():
         print("stopping")
 
     finally:
-        spi.transmit(pack_interrupt())
+        motors.stop()
+        uart.close()
         if camera_kind == "picamera2":
             camera.stop()
         elif camera_kind == "realsense":

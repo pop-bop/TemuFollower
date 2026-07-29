@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 
-from spi import SPIController, pack_movement, pack_interrupt
-from config import SPI_BUS, SPI_DEVICE, SPI_MAX_SPEED_HZ
+from uart_master import UARTMaster
+from motors import RobotMotors
 
 speed = 50
-
-def send_movement(spi, turn_val, fwd_val):
-    # Pack exactly 5 waypoints for SPI (constant movement)
-    waypoints = [(turn_val, fwd_val)] * 5
-    spi.transmit(pack_movement(waypoints))
 
 def main():
     global speed
 
-    spi = SPIController(bus=SPI_BUS, device=SPI_DEVICE, max_speed_hz=SPI_MAX_SPEED_HZ)
+    uart = UARTMaster()
+    motors = RobotMotors(uart)
 
-    print("DPSI-LFR motor test (SPI Mode)")
+    print("DPSI-LFR motor test (UART Mode)")
     print("Commands:")
     print("f = forward")
     print("b = backward")
@@ -31,27 +27,26 @@ def main():
         while True:
             cmd = input("> ").strip().lower()
             
-            fwd_val = int((speed / 100.0) * 127.0)
-            turn_val = int((speed / 100.0) * 127.0)
+            val = speed / 100.0
 
             if cmd == "f":
-                send_movement(spi, 0, fwd_val)
+                motors.forward(val)
                 print(f"forward, speed {speed}%")
 
             elif cmd == "b":
-                send_movement(spi, 0, -fwd_val)
+                motors.backward(val)
                 print(f"backward, speed {speed}%")
 
             elif cmd == "l":
-                send_movement(spi, turn_val, 0)
+                motors.spin_left(val)
                 print(f"spin left, speed {speed}%")
 
             elif cmd == "r":
-                send_movement(spi, -turn_val, 0)
+                motors.spin_right(val)
                 print(f"spin right, speed {speed}%")
 
             elif cmd == "s":
-                spi.transmit(pack_interrupt())
+                motors.stop()
                 print("stopped")
 
             elif cmd == "+":
@@ -70,8 +65,9 @@ def main():
                 print("unknown command")
 
     finally:
-        spi.transmit(pack_interrupt())
-        print("SPI cleaned up")
+        motors.stop()
+        uart.close()
+        print("UART cleaned up")
 
 if __name__ == "__main__":
     main()
