@@ -460,8 +460,9 @@ def main():
                 # Time until the robot's wheels reach the area the camera is currently looking at
                 t_ahead = distance_m / current_speed_mps
                 
-                # Backtrack future error to current wheels (e_now = e_future - de/dt * t)
-                error = clamp(future_error - (derivative * t_ahead), -1.0, 1.0)
+                # Backtrack future error to current wheels (e_now = e_future - spatial_slope * distance)
+                # We use predicted_heading (spatial curve) instead of temporal derivative to prevent high-frequency jitter!
+                error = clamp(future_error - (predicted_heading * distance_m), -1.0, 1.0)
                 
                 integral += error * dt
                 integral = clamp(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
