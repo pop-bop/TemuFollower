@@ -2,7 +2,6 @@ with open('main.py', 'r') as f:
     lines = f.readlines()
 
 new_lines = []
-skip = False
 for i, line in enumerate(lines):
     # Chunk 1
     if i >= 72 and i <= 84:

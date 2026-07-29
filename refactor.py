@@ -59,7 +59,7 @@ if apply_speeds_start != -1 and led_buzzer_end != -1:
                 waypoints = generate_waypoints(
                     trajectory_state, 
                     normal_error if normal_error is not None else 0.0,
-                    curve_sharpness if 'curve_sharpness' in locals() else 0.0,
+                    curve_sharpness if curve_sharpness is not None else 0.0,
                     applied_forward, 
                     dt=0.2, num=5, kp=current_kp, steer_invert=STEER_INVERT
                 )

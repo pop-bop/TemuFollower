@@ -76,4 +76,4 @@ class SPIController:
         if self.mock_mode:
             # print(f"Mock SPI Transmit: {data.hex()}")
             return
-        self.spi.xfer3(list(data))
+        self.spi.xfer2(list(data))

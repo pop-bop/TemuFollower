@@ -3,7 +3,6 @@ import unittest
 import numpy as np
 
 # Mock spidev
-import sys
 from unittest.mock import MagicMock
 sys.modules['spidev'] = MagicMock()
 

@@ -25,7 +25,10 @@ def main():
 
     try:
         while True:
-            cmd = input("> ").strip().lower()
+            try:
+                cmd = input("> ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                break
             
             val = speed / 100.0
 

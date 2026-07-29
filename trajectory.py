@@ -24,22 +24,24 @@ def _advance(state, derivs, dt_scale):
 
 
 def _rk4_integrate(state, target_error, target_heading, dt, error_gain, heading_gain):
-    dt = clamp(dt, 0.001, RK4_MAX_DT)
+    dt_remaining = dt
+    while dt_remaining > 0:
+        step_dt = min(dt_remaining, RK4_MAX_DT)
+        k1 = _derivatives(state, target_error, target_heading, error_gain, heading_gain)
+        k2 = _derivatives(_advance(state, k1, step_dt * 0.5), target_error, target_heading, error_gain, heading_gain)
+        k3 = _derivatives(_advance(state, k2, step_dt * 0.5), target_error, target_heading, error_gain, heading_gain)
+        k4 = _derivatives(_advance(state, k3, step_dt), target_error, target_heading, error_gain, heading_gain)
 
-    k1 = _derivatives(state, target_error, target_heading, error_gain, heading_gain)
-    k2 = _derivatives(_advance(state, k1, dt * 0.5), target_error, target_heading, error_gain, heading_gain)
-    k3 = _derivatives(_advance(state, k2, dt * 0.5), target_error, target_heading, error_gain, heading_gain)
-    k4 = _derivatives(_advance(state, k3, dt), target_error, target_heading, error_gain, heading_gain)
+        state["error"] += (step_dt / 6.0) * (
+            k1["error"] + 2.0 * k2["error"] + 2.0 * k3["error"] + k4["error"]
+        )
+        state["heading"] += (step_dt / 6.0) * (
+            k1["heading"] + 2.0 * k2["heading"] + 2.0 * k3["heading"] + k4["heading"]
+        )
+        state["error"] = clamp(state["error"], -1.0, 1.0)
+        state["heading"] = clamp(state["heading"], -1.0, 1.0)
+        dt_remaining -= step_dt
 
-    state["error"] += (dt / 6.0) * (
-        k1["error"] + 2.0 * k2["error"] + 2.0 * k3["error"] + k4["error"]
-    )
-    state["heading"] += (dt / 6.0) * (
-        k1["heading"] + 2.0 * k2["heading"] + 2.0 * k3["heading"] + k4["heading"]
-    )
-
-    state["error"] = clamp(state["error"], -1.0, 1.0)
-    state["heading"] = clamp(state["heading"], -1.0, 1.0)
     return state["error"], state["heading"]
 
 

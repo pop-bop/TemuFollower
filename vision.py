@@ -27,9 +27,10 @@ def get_expected_depth_map(w, h, tilt_deg, height_mm):
     tilt_rad = tilt_deg * np.pi / 180.0
     for y in range(h):
         ny = (y - h/2.0) / (h/2.0)
-        # Assuming origin is center of image, tilt down by tilt_rad
-        angle = tilt_rad - ny * (fov_y/2.0)
-        if angle <= 0.05: 
+        # Rows lower in the image (ny > 0) look further DOWN, so they strike the
+        # ground nearer the robot. The depression angle therefore grows with ny.
+        angle = tilt_rad + ny * (fov_y/2.0)
+        if angle <= 0.05:
             angle = 0.05
         expected[y, :] = height_mm / np.sin(angle)
     return expected

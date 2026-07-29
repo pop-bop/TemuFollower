@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import time
+from collections import deque
 
 import cv2
 
@@ -19,6 +20,7 @@ from config import (
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
     INTERSECTION_COOLDOWN_S, INTERSECTION_MEMORY_MAX_AGE_S,
     MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO, ROTATE_SETTLE_TIME_S,
+    VISION_DELAY_MIN_S, VISION_DELAY_MAX_S,
 )
 from camera import open_camera, read_frame
 from vision import (
@@ -92,6 +94,7 @@ def main():
     current_kd = KD
     trajectory_state = new_trajectory_state()
     curvature_state = new_trajectory_state()
+    vision_delay_queue = deque()
     smoothed_derivative = 0.0
     curve_sharpness = 0.0
     curve_speed_scale = 1.0
@@ -129,6 +132,7 @@ def main():
                     dead_end_recorded = False
                     reset_trajectory_state(trajectory_state)
                     reset_trajectory_state(curvature_state)
+                    vision_delay_queue.clear()
                     smoothed_derivative = 0.0
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
@@ -152,6 +156,7 @@ def main():
                     spin_start_time = None
                     reset_trajectory_state(trajectory_state)
                     reset_trajectory_state(curvature_state)
+                    vision_delay_queue.clear()
                     smoothed_derivative = 0.0
                     curve_sharpness = 0.0
                     curve_speed_scale = 1.0
@@ -178,6 +183,7 @@ def main():
                 continue
 
             frame = warp_frame(color_frame, warp_M)
+            warped_depth = None
             if expected_depth_map is not None and depth_frame is not None:
                 warped_depth = warp_frame(depth_frame, warp_M)
                 obstacle_mask = get_obstacle_mask(warped_depth, depth_scale, expected_depth_map)
@@ -351,6 +357,7 @@ def main():
                                 search_direction = 1.0
                                 reset_trajectory_state(trajectory_state)
                                 reset_trajectory_state(curvature_state)
+                                vision_delay_queue.clear()
                                 smoothed_derivative = 0.0
                                 state = "FOLLOW"
                             else:
@@ -445,7 +452,7 @@ def main():
                 cx = int(clamp(cx, 0, frame.shape[1] - 1))
                 
                 depth_mm = 300.0
-                if 'warped_depth' in locals() and warped_depth is not None:
+                if warped_depth is not None:
                     depth_mm = warped_depth[cy, cx] * (depth_scale * 1000.0)
                     if depth_mm <= 0 and expected_depth_map is not None: 
                         depth_mm = expected_depth_map[cy, cx]
@@ -453,16 +460,24 @@ def main():
                     depth_mm = expected_depth_map[cy, cx]
 
                 distance_m = max(depth_mm / 1000.0, 0.1)
-                
+
                 # Estimate speed in m/s (assuming applied_forward 1.0 ≈ 1.2 m/s top speed)
                 current_speed_mps = max(abs(applied_forward) * 1.2, 0.1)
-                
-                # Time until the robot's wheels reach the area the camera is currently looking at
-                t_ahead = distance_m / current_speed_mps
-                
-                # Backtrack future error to current wheels (e_now = e_future - spatial_slope * distance)
-                # We use predicted_heading (spatial curve) instead of temporal derivative to prevent high-frequency jitter!
-                error = clamp(future_error - (predicted_heading * distance_m), -1.0, 1.0)
+
+                # Persistence of vision: the camera is tilted 25 deg forward, so the
+                # ROI centroid is ground the wheels only reach t_ahead seconds later.
+                # Delay the observed error by that travel time instead of scaling it
+                # by distance -- a distance multiply swings with every centroid row
+                # change and is a direct jitter source.
+                t_ahead = clamp(
+                    distance_m / current_speed_mps,
+                    VISION_DELAY_MIN_S, VISION_DELAY_MAX_S,
+                )
+
+                vision_delay_queue.append((now, future_error))
+                while len(vision_delay_queue) > 1 and (now - vision_delay_queue[1][0]) >= t_ahead:
+                    vision_delay_queue.popleft()
+                error = clamp(vision_delay_queue[0][1], -1.0, 1.0)
                 
                 integral += error * dt
                 integral = clamp(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
@@ -614,6 +629,7 @@ def main():
             if state != prev_state and state in ("SPIN_SEARCH", "APPROACH", "FOLLOW", "BACKTRACK", "ROTATE"):
                 pass
 
+            prev_state = state
 
             # ----- MOTOR SPEED GENERATION & TRANSMIT -----
             if state == "STOP":
@@ -622,6 +638,7 @@ def main():
                 applied_left = 0.0
                 applied_right = 0.0
                 display_turn = 0.0
+                turn_component = 0.0
             else:
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
                 
@@ -676,6 +693,8 @@ def main():
             camera.stop()
         elif camera_kind == "realsense":
             camera[0].stop()
+        elif camera_kind == "usb":
+            camera.release()
         else:
             if hasattr(camera, 'release'): camera.release()
         if SHOW_DEBUG_VIEW:

@@ -39,6 +39,13 @@ CURVATURE_DAMPING = 0.6
 # a lot less overshoot-correct-overshoot.
 DERIVATIVE_SMOOTHING = 0.4
 
+# Persistence of vision. The camera is mounted tilted 25 deg forward, so it sees a
+# turn before the wheels reach it. The error observed now is held for the travel
+# time to that ground patch and only then steered on. Bounded so a bad depth
+# sample or a near-stopped robot can't stall or spike the delay.
+VISION_DELAY_MIN_S = 0.0
+VISION_DELAY_MAX_S = 0.45
+
 # SPEEDS
 SHARP_TURN_SPEED = 0.50
 MAX_TURN_SPEED = 0.65
@@ -83,6 +90,7 @@ MARKER_ACTION_DELAY_S = 1.0
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
+USB_CAMERA_INDEX = 0
 
 # Motor pins
 LEFT_ENA = 12

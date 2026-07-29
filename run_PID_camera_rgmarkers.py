@@ -763,7 +763,7 @@ def main():
                 turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
-                set_speeds(-0.2, 0.2, left_pwm, right_pwm)
+                set_speeds(applied_left, applied_right, left_pwm, right_pwm)
             else:
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
                 turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)

@@ -9,7 +9,7 @@ from utils import clamp
 def draw_debug_view(frame, debug_info, error, turn, left, right, state,
                      extra_lines=None, lookahead_bounds=None, lookahead_point=None,
                      far_bounds=None, far_point=None):
-    x0, y0, x1, y1 = debug_info["roi_bounds"]
+    x0, y0, x1, y1 = map(int, debug_info["roi_bounds"])
     debug = frame.copy()
 
     cv2.rectangle(debug, (x0, y0), (x1, y1), (0, 255, 255), 1)
@@ -17,21 +17,21 @@ def draw_debug_view(frame, debug_info, error, turn, left, right, state,
     cv2.line(debug, (center_x, y0), (center_x, y1), (255, 0, 0), 1)
 
     if lookahead_bounds is not None:
-        lx0, ly0, lx1, ly1 = lookahead_bounds
+        lx0, ly0, lx1, ly1 = map(int, lookahead_bounds)
         cv2.rectangle(debug, (lx0, ly0), (lx1, ly1), (255, 128, 0), 1)
 
     if far_bounds is not None:
-        fx0, fy0, fx1, fy1 = far_bounds
+        fx0, fy0, fx1, fy1 = map(int, far_bounds)
         cv2.rectangle(debug, (fx0, fy0), (fx1, fy1), (255, 0, 255), 1)
 
     if debug_info["line_point"] is not None:
-        cv2.circle(debug, debug_info["line_point"], 5, (0, 0, 255), -1)
+        cv2.circle(debug, tuple(map(int, debug_info["line_point"])), 5, (0, 0, 255), -1)
 
     if lookahead_point is not None:
-        cv2.circle(debug, lookahead_point, 5, (255, 128, 0), -1)
+        cv2.circle(debug, tuple(map(int, lookahead_point)), 5, (255, 128, 0), -1)
 
     if far_point is not None:
-        cv2.circle(debug, far_point, 5, (255, 0, 255), -1)
+        cv2.circle(debug, tuple(map(int, far_point)), 5, (255, 0, 255), -1)
 
     lines = [
         f"state: {state}",
