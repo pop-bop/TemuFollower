@@ -428,10 +428,8 @@ def main():
                     MIN_CURVE_SPEED_SCALE, 1.0,
                 )
 
-                error = predicted_error
-                integral += error * dt
-                integral = clamp(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
-                raw_derivative = (error - last_error) / dt
+                future_error = predicted_error
+                raw_derivative = (future_error - last_error) / dt
                 # Smooth the derivative -- a raw frame-to-frame derivative of a
                 # noisy vision error is the classic driver of turn oscillation.
                 smoothed_derivative = (
@@ -439,7 +437,34 @@ def main():
                     + DERIVATIVE_SMOOTHING * smoothed_derivative
                 )
                 derivative = smoothed_derivative
-                last_error = error
+                last_error = future_error
+
+                # Account for camera look-ahead distance using Intel depth ROI
+                cx, cy = normal_debug.get("line_point") or (frame.shape[1]//2, frame.shape[0]//2)
+                cy = int(clamp(cy, 0, frame.shape[0] - 1))
+                cx = int(clamp(cx, 0, frame.shape[1] - 1))
+                
+                depth_mm = 300.0
+                if 'warped_depth' in locals() and warped_depth is not None:
+                    depth_mm = warped_depth[cy, cx] * (depth_scale * 1000.0)
+                    if depth_mm <= 0 and expected_depth_map is not None: 
+                        depth_mm = expected_depth_map[cy, cx]
+                elif expected_depth_map is not None:
+                    depth_mm = expected_depth_map[cy, cx]
+
+                distance_m = max(depth_mm / 1000.0, 0.1)
+                
+                # Estimate speed in m/s (assuming applied_forward 1.0 ≈ 1.2 m/s top speed)
+                current_speed_mps = max(abs(applied_forward) * 1.2, 0.1)
+                
+                # Time until the robot's wheels reach the area the camera is currently looking at
+                t_ahead = distance_m / current_speed_mps
+                
+                # Backtrack future error to current wheels (e_now = e_future - de/dt * t)
+                error = clamp(future_error - (derivative * t_ahead), -1.0, 1.0)
+                
+                integral += error * dt
+                integral = clamp(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
 
                 line_confidence = normal_debug.get("line_confidence", 1.0)
                 current_kp, current_ki, current_kd = schedule_pid_gains(
