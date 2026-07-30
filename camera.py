@@ -42,6 +42,18 @@ def _open_usb_camera():
     print("No depth stream: obstacle detection is disabled, line following only.")
     return cap
 
+def profile_device_usb():
+    """USB spec the RealSense is attached at, e.g. 2.1 or 3.2. None if unknown."""
+    devices = rs.context().query_devices()
+    if len(devices) == 0:
+        return None
+    desc = devices[0].get_info(rs.camera_info.usb_type_descriptor)
+    try:
+        return float(desc)
+    except (TypeError, ValueError):
+        return None
+
+
 def open_camera():
     if rs is not None:
         pipeline = rs.pipeline()
@@ -52,7 +64,23 @@ def open_camera():
 
         # The D435 (non-i) has no IMU, so a motion stream request hard-fails the
         # whole pipeline. Try with motion, then retry without.
+        #
+        # A USB-2 link is the nastier case: depth + color + IMU exceeds its
+        # bandwidth, but the pipeline still STARTS. Frames then never arrive and
+        # wait_for_frames times out far from here, so drop the IMU up front
+        # rather than letting it look like a stream-rate bug.
         want_imu = IMU_ENABLED
+        if want_imu:
+            usb = None
+            try:
+                usb = profile_device_usb()
+            except Exception:
+                usb = None
+            if usb is not None and usb < 3.0:
+                print(f"USB {usb} link: too little bandwidth for depth+color+IMU. "
+                      "Disabling IMU -- move the camera to the blue USB-3 port "
+                      "to get odometry back.")
+                want_imu = False
         if want_imu:
             try:
                 config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, IMU_ACCEL_FPS)
