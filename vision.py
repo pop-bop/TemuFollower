@@ -8,7 +8,8 @@ from config import (
     FAR_ROI_Y_START_RATIO, FAR_ROI_Y_END_RATIO,
     FAR_ROI_X_START_RATIO, FAR_ROI_X_END_RATIO,
     WIDE_ROI_Y_START_RATIO, WIDE_ROI_X_START_RATIO, WIDE_ROI_X_END_RATIO,
-    BLACK_THRESHOLD, MIN_LINE_AREA, GREEN_DIFF_THRESHOLD, RED_DIFF_THRESHOLD,
+    BLACK_THRESHOLD, MIN_LINE_AREA, LINE_CONFIDENCE_FULL_AREA,
+    GREEN_DIFF_THRESHOLD, RED_DIFF_THRESHOLD,
     MIN_MARKER_AREA, INTERSECTION_MIN_AREA, INTERSECTION_MIN_CONTOURS,
     WARP_MATRIX, GROUND_DEPTH_TOLERANCE_MM, OBSTACLE_DETECTION_ENABLED,
     OBSTACLE_BAND_ENABLED,
@@ -20,6 +21,12 @@ def get_warp_matrix():
     return np.array(WARP_MATRIX, dtype=np.float32)
 
 def warp_frame(frame, M):
+    # WARP_MATRIX is the identity by default, and warpPerspective on a 640x480
+    # frame is not free -- it was resampling every frame (twice, when depth is on)
+    # just to produce a pixel-for-pixel copy. Skip it unless a real homography is
+    # configured.
+    if M is None or np.array_equal(M, np.eye(3, dtype=np.float32)):
+        return frame
     h, w = frame.shape[:2]
     return cv2.warpPerspective(frame, M, (w, h))
 
@@ -165,6 +172,12 @@ def find_line_error(frame, obstacle_mask, y_start_ratio, y_end_ratio, x_start_ra
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Global threshold, not adaptiveThreshold. Adaptive is relative to the local
+    # neighbourhood mean, so it has no concept of "no line here": on blank floor
+    # it thresholds sensor noise and reports a 26000px contour with a confident
+    # error. Measured on the blank-floor frames from the 2026-07-30 run, where
+    # the robot drove at turn=+0.80 against an empty mat. A global cut says LINE
+    # LOST on those same frames, which is the correct answer.
     _, black_mask = cv2.threshold(blur, BLACK_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
 
     black_mask[green_mask > 0] = 0
@@ -193,8 +206,25 @@ def find_line_error(frame, obstacle_mask, y_start_ratio, y_end_ratio, x_start_ra
     largest = max(contours, key=cv2.contourArea)
     line_area = cv2.contourArea(largest)
     debug_info["line_area"] = line_area
-    debug_info["line_confidence"] = clamp(line_area / max(float(MIN_LINE_AREA * 8), 1.0), 0.0, 1.0)
+    # Scale against a healthy line, not MIN_LINE_AREA*8. That reference was set
+    # when MIN_LINE_AREA was 45 at 320x240 (ref 360, comparable to a real line).
+    # After the 640x480 rescale to 180 the reference became 1440 while a plain
+    # straight line measures ~9700px, so this pinned to 1.0 on every frame and
+    # silently disabled LOW_CONFIDENCE_SPEED_SCALE, ADAPTIVE_KP_CONFIDENCE_DROP,
+    # LOOKAHEAD_CONFIDENCE_MIN and FAR_CONFIDENCE_MIN.
+    debug_info["line_confidence"] = clamp(
+        line_area / max(float(LINE_CONFIDENCE_FULL_AREA), 1.0), 0.0, 1.0)
     if line_area < MIN_LINE_AREA:
+        return None, debug_info
+
+    # A line is a stripe within the ROI, so it cannot fill the ROI. When the
+    # frame goes dark -- auto-exposure still converging, or a light change --
+    # EVERY pixel falls under the threshold and the "line" becomes one blob
+    # covering the whole ROI, whose centroid is the ROI centre. That reads as a
+    # perfectly centred line (error 0.00) at maximum confidence, so the robot
+    # drives straight on no evidence. Measured at 51750px of a 52416px ROI.
+    if line_area > 0.60 * black_mask.size:
+        debug_info["line_confidence"] = 0.0
         return None, debug_info
 
     near_line_zone = np.zeros(black_mask.shape, dtype=np.uint8)

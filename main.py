@@ -2,27 +2,60 @@
 import time
 import signal
 import sys
+import select
+import atexit
 from collections import deque
+
+term_fd = None
+term_old_settings = None
+try:
+    import tty
+    import termios
+    term_fd = sys.stdin.fileno()
+    term_old_settings = termios.tcgetattr(term_fd)
+    tty.setcbreak(term_fd)
+    def cleanup_term():
+        termios.tcsetattr(term_fd, termios.TCSADRAIN, term_old_settings)
+    atexit.register(cleanup_term)
+except Exception:
+    pass
+
+def get_terminal_key():
+    if term_fd is not None:
+        dr, _, _ = select.select([sys.stdin], [], [], 0)
+        if dr:
+            # select reports a closed stdin as readable, and reading it returns
+            # "" rather than blocking. Under the harness stdin is not a terminal,
+            # so that happened on the very first loop iteration and ord("")
+            # killed the run before a single frame was processed.
+            ch = sys.stdin.read(1)
+            if ch:
+                return ord(ch)
+    return -1
 
 import cv2
 
 from config import (
     KP, KI, KD, TURN_LIMIT, CENTER_DEADZONE,
-    SHARP_TURN_SPEED, MAX_TURN_SPEED, STEER_INVERT,
+    SHARP_TURN_SPEED, MAX_TURN_SPEED, SPEED_CAP_SCALE, STEER_INVERT,
     BASE_SPEED, MAX_SPEED, MIN_SPEED, SPIN_SEARCH_SPEED, APPROACH_SPEED,
-    LINE_LOST_STOP_TIMEOUT_S, SLEW_RATE_PER_S, MANUAL_SPEED, MANUAL_KEY_TIMEOUT_S,
+    LINE_LOST_STOP_TIMEOUT_S, LINE_LOST_GRACE_FRAMES,
+    WIDE_MIN_LINE_AREA, WIDE_MAX_LINE_AREA, APPROACH_TURN_LIMIT,
+    SLEW_RATE_PER_S, MANUAL_SPEED, MANUAL_KEY_TIMEOUT_S,
     SHOW_DEBUG_VIEW, DEBUG_VIEW_EVERY_N_FRAMES, LOOP_LOG_INTERVAL_S,
     INTEGRAL_LIMIT, LOW_CONFIDENCE_SPEED_SCALE,
     ERROR_SPEED_REDUCTION, DERIVATIVE_SPEED_REDUCTION, STRAIGHT_SPEED_BOOST,
     ADAPTIVE_DERIVATIVE_REF, CURVE_SPEED_REDUCTION, CURVE_TURN_BOOST,
-    MIN_CURVE_SPEED_SCALE, NEAR_TRAJECTORY_WEIGHT, LOOKAHEAD_TRAJECTORY_WEIGHT,
+    MIN_CURVE_SPEED_SCALE,
     LOOKAHEAD_CONFIDENCE_MIN, FAR_CONFIDENCE_MIN, CURVATURE_DAMPING,
-    DERIVATIVE_SMOOTHING, ACCEL_BUZZER_ENABLED, ACCEL_SPEED_DELTA_THRESHOLD,
+    DERIVATIVE_SMOOTHING, DERIVATIVE_CLAMP,
+    ACCEL_BUZZER_ENABLED, ACCEL_SPEED_DELTA_THRESHOLD,
     MARKER_ACTION_DELAY_S,
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
     INTERSECTION_COOLDOWN_S, INTERSECTION_MEMORY_MAX_AGE_S,
     MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO, ROTATE_SETTLE_TIME_S,
     VISION_DELAY_S, TURN_SLEW_RATE_PER_S,
+    NONLINEAR_ERROR_MAPPING, TURN_DEADBAND,
     VISION_DELAY_MIN_S, VISION_DELAY_MAX_S, VISION_DELAY_FROM_ODOMETRY,
     ODOMETRY_ENABLED, BEV_ENABLED, BEV_NEAR_MM, BEV_CAMERA_AXLE_OFFSET_MM,
     OBSTACLE_BAND_ENABLED, OBSTACLE_BAND_MIN_FRAMES, OBSTACLE_DROPOUT_FRAMES,
@@ -34,8 +67,8 @@ from camera import (
     open_camera, read_frame, read_frame_with_motion, has_imu, get_intrinsics,
 )
 from vision import (
-    find_line_error_normal, find_line_error_lookahead, find_line_error_far,
-    find_line_error_wide, print_calibration_info, detect_intersection_normal,
+    find_line_error_normal, find_line_error_lookahead, find_line_error_far, find_line_error_wide,
+    print_calibration_info, detect_intersection_normal,
     detect_obstacle_band,
 )
 from pi_motors import create_motors
@@ -154,6 +187,7 @@ def sigterm_handler(signum, frame):
     sys.exit(0)
 
 def main():
+    global SHOW_DEBUG_VIEW
     signal.signal(signal.SIGTERM, sigterm_handler)
     # SIGHUP too: it fires when an SSH session drops, which is how this robot is
     # driven. Without it the process dies without unwinding and the PWM stays
@@ -212,6 +246,7 @@ def main():
     last_manual_command = None
 
     prev_state = None
+    line_lost_frames = 0
     prev_sharp_turn = False
     prev_red_marker = False
     prev_green_marker = False
@@ -254,71 +289,78 @@ def main():
             instant_fps = 1.0 / dt
             fps_ema = instant_fps if fps_ema <= 0.0 else (fps_ema * 0.9) + (instant_fps * 0.1)
 
-            key = -1
-            if SHOW_DEBUG_VIEW:
+            key = get_terminal_key()
+            if key == -1 and SHOW_DEBUG_VIEW:
                 key = cv2.waitKey(1) & 0xFF
-                if key == 32:
-                    if mode != "MANUAL":
-                        print("SWITCHED TO MANUAL: use w/a/s/d, space=stop, enter=back to auto")
-                    mode = "MANUAL"
-                    applied_forward = 0.0
-                    applied_turn = 0.0
-                    last_manual_command = None
-                    pending_marker_color = None
-                    pending_marker_action_time = None
-                    backtrack_intersection_wp = None
-                    backtrack_target_branch_idx = None
-                    backtrack_start_time = None
-                    rotate_settle_until = None
-                    dead_end_recorded = False
-                    reset_trajectory_state(trajectory_state)
-                    reset_trajectory_state(curvature_state)
-                    vision_delay_queue.clear()
-                    smoothed_derivative = 0.0
-                    curve_sharpness = 0.0
-                    curve_speed_scale = 1.0
-                    prev_speed_for_accel = 0.0
-                    motors.stop()
-                elif key in (13, 10):
-                    if mode != "AUTO":
-                        print("SWITCHED TO AUTO: resuming line following")
-                    mode = "AUTO"
-                    state = "FOLLOW"
-                    applied_forward = 0.0
-                    applied_turn = 0.0
-                    integral = 0.0
-                    last_error = 0.0
-                    pending_marker_color = None
-                    pending_marker_action_time = None
-                    backtrack_intersection_wp = None
-                    backtrack_target_branch_idx = None
-                    backtrack_start_time = None
-                    rotate_settle_until = None
-                    dead_end_recorded = False
-                    spin_start_time = None
-                    reset_trajectory_state(trajectory_state)
-                    reset_trajectory_state(curvature_state)
-                    vision_delay_queue.clear()
-                    smoothed_derivative = 0.0
-                    curve_sharpness = 0.0
-                    curve_speed_scale = 1.0
-                    prev_speed_for_accel = 0.0
-                    motors.stop()
-                    if halted:
-                        print("MANUAL OVERRIDE: clearing red-marker halt")
-                    halted = False
-                elif mode == "MANUAL" and key in (ord("w"), ord("a"), ord("s"), ord("d")):
-                    last_manual_key_time = now
-                    last_manual_command = key
-                elif key == ord("r"):
-                    pass
-                    print("RED LED SPI trigger (0.5s)")
-                elif key == ord("g"):
-                    pass
-                    print("GREEN LED SPI trigger (0.5s)")
-                elif key == ord("b"):
-                    pass
-                    print("BUZZER manual test tone")
+            
+            if key == ord('k'):
+                SHOW_DEBUG_VIEW = not SHOW_DEBUG_VIEW
+                print(f"Toggled camera view: {SHOW_DEBUG_VIEW}")
+                if not SHOW_DEBUG_VIEW:
+                    cv2.destroyAllWindows()
+            
+            if key == 32:
+                if mode != "MANUAL":
+                    print("SWITCHED TO MANUAL: use w/a/s/d, space=stop, enter=back to auto")
+                mode = "MANUAL"
+                applied_forward = 0.0
+                applied_turn = 0.0
+                last_manual_command = None
+                pending_marker_color = None
+                pending_marker_action_time = None
+                backtrack_intersection_wp = None
+                backtrack_target_branch_idx = None
+                backtrack_start_time = None
+                rotate_settle_until = None
+                dead_end_recorded = False
+                reset_trajectory_state(trajectory_state)
+                reset_trajectory_state(curvature_state)
+                vision_delay_queue.clear()
+                smoothed_derivative = 0.0
+                curve_sharpness = 0.0
+                curve_speed_scale = 1.0
+                prev_speed_for_accel = 0.0
+                motors.stop()
+            elif key in (13, 10):
+                if mode != "AUTO":
+                    print("SWITCHED TO AUTO: resuming line following")
+                mode = "AUTO"
+                state = "FOLLOW"
+                applied_forward = 0.0
+                applied_turn = 0.0
+                integral = 0.0
+                last_error = 0.0
+                pending_marker_color = None
+                pending_marker_action_time = None
+                backtrack_intersection_wp = None
+                backtrack_target_branch_idx = None
+                backtrack_start_time = None
+                rotate_settle_until = None
+                dead_end_recorded = False
+                spin_start_time = None
+                reset_trajectory_state(trajectory_state)
+                reset_trajectory_state(curvature_state)
+                vision_delay_queue.clear()
+                smoothed_derivative = 0.0
+                curve_sharpness = 0.0
+                curve_speed_scale = 1.0
+                prev_speed_for_accel = 0.0
+                motors.stop()
+                if halted:
+                    print("MANUAL OVERRIDE: clearing red-marker halt")
+                halted = False
+            elif mode == "MANUAL" and key in (ord("w"), ord("a"), ord("s"), ord("d")):
+                last_manual_key_time = now
+                last_manual_command = key
+            elif key == ord("r"):
+                pass
+                print("RED LED SPI trigger (0.5s)")
+            elif key == ord("g"):
+                pass
+                print("GREEN LED SPI trigger (0.5s)")
+            elif key == ord("b"):
+                pass
+                print("BUZZER manual test tone")
 
             color_frame, depth_frame, motion_samples = read_frame_with_motion(
                 camera_kind, camera
@@ -702,91 +744,125 @@ def main():
                             target_turn = ROTATE_SPEED * 0.5 if not STEER_INVERT else -ROTATE_SPEED * 0.5
 
             # ----- NORMAL LINE FOLLOWING -----
+            # Coast through a brief near-ROI dropout instead of dropping straight
+            # to SPIN_SEARCH. The near ROI only sees ~71-96mm ahead of the lens,
+            # so a single missed frame is usually the line leaving that narrow
+            # strip mid-correction, not a genuinely lost line. SPIN_SEARCH sets
+            # target_forward=0 and resets applied_turn, so reacting to one frame
+            # stopped the robot dead and restarted the turn ramp -- the
+            # FOLLOW/SPIN_SEARCH flapping seen on the 2026-07-30 runs.
+            elif normal_error is None and prev_state == "FOLLOW" and \
+                    line_lost_frames < LINE_LOST_GRACE_FRAMES:
+                line_lost_frames += 1
+                state = "FOLLOW"
+                target_forward = applied_forward
+                # Decay rather than hold: the last command before losing the
+                # line is usually a hard correction, and holding it blind for
+                # 3 frames carries the robot further from the line (captured
+                # frame: coasting at turn=-0.44 over blank floor). Halving per
+                # frame keeps the correction's direction but sheds its bite.
+                target_turn = applied_turn * 0.5
+                display_turn = target_turn
+                active_debug = normal_debug
+
             elif normal_error is not None:
+                line_lost_frames = 0
                 state = "FOLLOW"
                 dead_end_recorded = False
 
-                # Look ahead above the normal ROI to anticipate curves before
-                # the near ROI reacts to them.
+                # Look ahead and far to build a weighted vector of the line's path
                 lookahead_error, lookahead_debug = find_line_error_lookahead(frame, obstacle_mask)
-                lookahead_confidence = lookahead_debug.get("line_confidence", 0.0)
-                lookahead_ok = lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN
-
-                # Third ROI, farther out still -- lets the robot see a curve
-                # closing back out before the lookahead ROI does.
                 far_error, far_debug = find_line_error_far(frame, obstacle_mask)
-                far_confidence = far_debug.get("line_confidence", 0.0)
-                far_ok = far_error is not None and far_confidence >= FAR_CONFIDENCE_MIN
-
+                
+                h, w = frame.shape[:2]
+                robot_x = w / 2.0
+                robot_y = float(h)
+                
+                total_vx = 0.0
+                total_vy = 0.0
+                
+                def add_vector(debug_dict, weight):
+                    nonlocal total_vx, total_vy
+                    if debug_dict is not None and "line_point" in debug_dict:
+                        cx, cy = debug_dict["line_point"]
+                        vx = cx - robot_x
+                        vy = robot_y - cy
+                        length = (vx**2 + vy**2)**0.5
+                        if length > 0.001:
+                            total_vx += weight * (vx / length)
+                            total_vy += weight * (vy / length)
+                            
+                add_vector(normal_debug if normal_error is not None else None, 1.0)
+                add_vector(lookahead_debug if lookahead_error is not None else None, 2.0)
+                add_vector(far_debug if far_error is not None else None, 1.0)
+                
+                sum_length = (total_vx**2 + total_vy**2)**0.5
+                if sum_length > 0.001:
+                    trajectory_target_error = total_vx / sum_length
+                else:
+                    trajectory_target_error = normal_error
+                    
+                lookahead_confidence = lookahead_debug.get("line_confidence", 0.0) if lookahead_error is not None else 0.0
+                lookahead_ok = lookahead_error is not None and lookahead_confidence >= LOOKAHEAD_CONFIDENCE_MIN
+                
                 if lookahead_ok:
                     curve = lookahead_error - normal_error
-                    # Trust the look-ahead ROI more at speed and when already
-                    # centered; fall back to the near ROI when off-center or
-                    # nearly stopped, since the near line is the safety anchor.
-                    speed_factor = clamp(abs(applied_forward) / max(BASE_SPEED, 0.001), 0.0, 1.0)
-                    off_center_factor = clamp(abs(normal_error) / max(CENTER_DEADZONE, 0.001), 0.0, 1.0)
-                    lookahead_trust = speed_factor * (1.0 - 0.5 * off_center_factor)
-                    lookahead_weight = LOOKAHEAD_TRAJECTORY_WEIGHT * lookahead_trust
-                    near_weight = NEAR_TRAJECTORY_WEIGHT + LOOKAHEAD_TRAJECTORY_WEIGHT * (1.0 - lookahead_trust)
-                    trajectory_target_error = (near_weight * normal_error) + (lookahead_weight * lookahead_error)
                 else:
                     curve = 0.0
-                    trajectory_target_error = normal_error
 
                 predicted_error, predicted_heading = rk4_step(
                     trajectory_state, trajectory_target_error, curve, dt,
                 )
 
-                # ----- Layer 2: curvature trend from the lookahead/far span -----
-                # far_curve is the curvature the near/lookahead layer will see a
-                # moment from now; comparing it against the current curve tells
-                # us whether the turn is tightening or closing back out.
-                far_curve = (far_error - lookahead_error) if (lookahead_ok and far_ok) else curve
-                curvature_rate_target = far_curve - curve
-                predicted_curvature, predicted_curvature_rate = rk4_step_curvature(
-                    curvature_state, far_curve, curvature_rate_target, dt,
-                )
-
                 curve_sharpness = clamp(abs(predicted_heading), 0.0, 1.0)
-                # If the curvature rate opposes the current heading, the turn is
-                # closing out -- damp the turn boost pre-emptively instead of
-                # waiting for the near ROI to straighten and overshooting the
-                # correction (a common cause of oscillation on exits).
-                # Applied continuously rather than as a sign test: a binary switch
-                # on the product of two noisy estimates toggled at frame rate.
-                closing_amount = clamp(
-                    -predicted_curvature_rate * predicted_heading, 0.0, 1.0,
-                )
-                curvature_damping = clamp(1.0 - CURVATURE_DAMPING * closing_amount, 0.0, 1.0)
-
                 curve_speed_scale = clamp(
                     1.0 - CURVE_SPEED_REDUCTION * curve_sharpness,
                     MIN_CURVE_SPEED_SCALE, 1.0,
                 )
 
-                future_error = predicted_error
-                raw_derivative = (future_error - last_error) / dt
-                # Smooth the derivative -- a raw frame-to-frame derivative of a
-                # noisy vision error is the classic driver of turn oscillation.
-                smoothed_derivative = (
-                    (1.0 - DERIVATIVE_SMOOTHING) * raw_derivative
-                    + DERIVATIVE_SMOOTHING * smoothed_derivative
-                )
-                derivative = smoothed_derivative
-                last_error = future_error
-
-                # Persistence of vision: the camera is tilted forward, so the ROI
-                # centroid is ground the wheels only reach vision_delay later.
-                # An earlier version derived this from a single raw depth pixel
-                # inside the sensor's blind zone and swung the loop's phase lag
-                # 141-450ms frame to frame, which oscillates at any gain. It is
-                # now derived from FUSED speed, which is smooth and clamped to
-                # [VISION_DELAY_MIN_S, VISION_DELAY_MAX_S], and falls back to the
-                # fixed VISION_DELAY_S whenever odometry is unhealthy.
-                vision_delay_queue.append((now, future_error))
+                # Vision delay: the camera looks down 22.5 deg from horizontal,
+                # so the near ROI is ground ~90mm AHEAD of the wheels. Steering
+                # on what the camera sees now corrects for a line the wheels
+                # have not reached yet; the line under the wheels is the one
+                # seen vision_delay ago. Queue holds (t, error); the oldest
+                # entry within the window is the ground now beneath the robot.
+                vision_delay_queue.append((now, predicted_error))
                 while len(vision_delay_queue) > 1 and (now - vision_delay_queue[1][0]) >= vision_delay:
                     vision_delay_queue.popleft()
-                error = clamp(vision_delay_queue[0][1], -1.0, 1.0)
+                # Until the queue spans the full delay it holds only recent
+                # samples, so the oldest is NOT yet the ground under the wheels.
+                # Using it anyway means the loop runs undelayed for the first
+                # ~0.35s and then steps to a fully delayed error in one frame --
+                # a phase jump mid-drive. Ramp in instead: blend the delayed
+                # sample against the current one by how much of the window the
+                # queue actually covers.
+                oldest_t = vision_delay_queue[0][0]
+                fill = clamp((now - oldest_t) / max(vision_delay, 1e-6), 0.0, 1.0)
+                delayed_error = vision_delay_queue[0][1]
+                # Bypass RK4 and Vision Delay for the primary PID error.
+                # RK4 introduces a 100ms phase lag (10 rad/s), and vision delay
+                # introduces more. Phase lag in the primary error causes oscillation.
+                raw_error = clamp(trajectory_target_error, -1.0, 1.0)
+                
+                if NONLINEAR_ERROR_MAPPING:
+                    error = (raw_error ** 2) * (1.0 if raw_error > 0 else -1.0)
+                else:
+                    error = raw_error
+
+                # Calculate and smooth the derivative
+                if prev_state != "FOLLOW":
+                    raw_derivative = 0.0
+                    smoothed_derivative = 0.0
+                else:
+                    raw_derivative = (error - last_error) / dt
+                    # Apply the missing DERIVATIVE_SMOOTHING (exponential moving average)
+                    smoothed_derivative = (
+                        DERIVATIVE_SMOOTHING * raw_derivative +
+                        (1.0 - DERIVATIVE_SMOOTHING) * smoothed_derivative
+                    )
+                
+                derivative = clamp(smoothed_derivative, -DERIVATIVE_CLAMP, DERIVATIVE_CLAMP)
+                last_error = error
                 
                 integral += error * dt
                 integral = clamp(integral, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
@@ -797,10 +873,16 @@ def main():
                 )
 
                 raw_turn = (current_kp * error) + (current_ki * integral) + (current_kd * derivative)
-                raw_turn *= 1.0 + CURVE_TURN_BOOST * curve_sharpness * curvature_damping
+                # old_working's boost: no curvature_damping factor (that came
+                # from the removed second RK4 layer).
+                raw_turn *= 1.0 + CURVE_TURN_BOOST * curve_sharpness
                 raw_turn = clamp(raw_turn, -TURN_LIMIT, TURN_LIMIT)
                 display_turn = raw_turn
                 motor_turn = -raw_turn if STEER_INVERT else raw_turn
+                
+                # Apply Deadband Compensation for skid-steer
+                if TURN_DEADBAND > 0.0 and abs(motor_turn) > 0.01:
+                    motor_turn += TURN_DEADBAND if motor_turn > 0 else -TURN_DEADBAND
 
                 abs_error = abs(error)
                 if abs_error <= CENTER_DEADZONE:
@@ -815,12 +897,6 @@ def main():
                     turn_sign = 1.0 if motor_turn >= 0 else -1.0
                     target_forward = BASE_SPEED * (1.0 - blend)
                     target_turn = motor_turn * (1.0 - blend) + (SHARP_TURN_SPEED * turn_sign) * blend
-
-                # The blend above deliberately drives forward speed to zero on the
-                # sharpest turns so the robot can pivot. Remember whether it ever
-                # intended to translate, because the clamp below must not
-                # resurrect a speed the geometry just cancelled.
-                wants_to_translate = target_forward >= MIN_SPEED
 
                 derivative_load = clamp(
                     abs(derivative) / max(0.001, ADAPTIVE_DERIVATIVE_REF),
@@ -837,13 +913,14 @@ def main():
                     )
                     target_forward *= clamp(confidence_scale, LOW_CONFIDENCE_SPEED_SCALE, 1.0)
 
-                # Floor at MIN_SPEED only if we meant to move forward at all.
-                # Flooring unconditionally undid every taper above and pinned
-                # forward at exactly MIN_SPEED through hard turns, forcing the
-                # robot to creep through corners it should have pivoted around.
-                target_forward = clamp(
-                    target_forward, MIN_SPEED if wants_to_translate else 0.0, MAX_SPEED,
-                )
+                # Always keep translating, as old_working did. The conditional
+                # floor that replaced this let target_forward reach 0 whenever the
+                # blend cut it below MIN_SPEED, so at |error|>0.45 the robot yawed
+                # hard while standing still. The near ROI only sees ~71-96mm ahead
+                # of the lens, so a stationary yaw sweeps the line straight out of
+                # it and the next frame reads LINE LOST. Measured on the
+                # 2026-07-30 harness run: FOLLOW frames at forward=+0.02..0.04.
+                target_forward = clamp(target_forward, MIN_SPEED, MAX_SPEED)
 
                 search_direction = 1.0 if error >= 0 else -1.0
                 if STEER_INVERT:
@@ -870,11 +947,23 @@ def main():
 
                 wide_error, wide_debug = find_line_error_wide(frame, obstacle_mask)
 
-                if wide_error is not None:
+                # The wide ROI spans the whole lower frame (245760px), so it sees
+                # mat edges, floor seams and shadows the near ROI never does, and
+                # find_line_error accepts any blob from MIN_LINE_AREA (180px) up
+                # to the 60%-of-ROI guard (147456px) at confidence 1.00. APPROACH
+                # then drove at APPROACH_SPEED with turn=KP*error toward whatever
+                # that was -- which is how the robot rammed a wall on blank floor
+                # on 2026-07-30. Require a blob that is plausibly the line.
+                wide_area = wide_debug.get("line_area", 0.0)
+                wide_ok = (wide_error is not None
+                           and WIDE_MIN_LINE_AREA <= wide_area <= WIDE_MAX_LINE_AREA)
+
+                if wide_ok:
                     state = "APPROACH"
                     dead_end_recorded = False
                     active_debug = wide_debug
-                    raw_turn = clamp(KP * wide_error, -TURN_LIMIT, TURN_LIMIT)
+                    raw_turn = clamp(KP * wide_error,
+                                     -APPROACH_TURN_LIMIT, APPROACH_TURN_LIMIT)
                     display_turn = raw_turn
                     motor_turn = -raw_turn if STEER_INVERT else raw_turn
                     target_forward = APPROACH_SPEED
@@ -966,7 +1055,12 @@ def main():
                 display_turn = 0.0
                 turn_component = 0.0
             else:
-                applied_forward = slew_toward(applied_forward, target_forward, max_step)
+                # Bench-test governor. Scales every forward command on the way to
+                # the motors so a runaway cannot build speed into a wall while
+                # the loop is still being tuned on the floor. 1.0 is a no-op.
+                applied_forward = slew_toward(applied_forward,
+                                              target_forward * SPEED_CAP_SCALE,
+                                              max_step)
 
                 # Update visual variables for debug UI
                 turn_component = slew_toward(
@@ -1001,6 +1095,7 @@ def main():
                     lookahead_point=lookahead_point,
                     far_bounds=far_bounds,
                     far_point=far_point,
+                    depth_frame=depth_frame,
                 )
                 lean_ratio = (display_turn / TURN_LIMIT) if display_turn is not None else None
                 draw_roi_arrow_view(active_debug, applied_left, applied_right, state, lean_ratio)

@@ -1,14 +1,32 @@
 # PID
-KP = 0.95
-KI = 0.01
-KD = 0.15
+# old_working's KP=1.10 was tuned when the loop ran 320x240@120fps (~8ms/frame).
+# The loop now measures ~33ms/frame plus 2-4 frames of turn slew, so a correction
+# lands on information 4x staler: at KP=1.10 the robot crossed the line before
+# the correction unwound and the error sign flipped 38-73% of frames (measured
+# 2026-07-30). Gain must come down with loop rate; KD up a little for damping.
+# The earlier antigravity detune to KP=0.22 was the right idea overdone -- that
+# was compensating for a noise-driven input as well, which is now fixed.
+KP = 0.10
+KI = 0.02
+KD = 0.06
 TURN_LIMIT = 0.80
 CENTER_DEADZONE = 0.12
+# Squaring the error to soften small corrections: also part of the above
+# compensation, and it silently halves the effective KP everywhere the line is
+# only slightly off-centre, which is most of a lap.
+NONLINEAR_ERROR_MAPPING = False
+TURN_DEADBAND = 0.10
 ADAPTIVE_PID_ENABLED = True
-ADAPTIVE_KP_ERROR_BOOST = 0.55
-ADAPTIVE_KP_CONFIDENCE_DROP = 0.25
-ADAPTIVE_KD_ERROR_BOOST = 0.35
-ADAPTIVE_KD_DERIVATIVE_BOOST = 0.55
+# Was 0.55, which pushed KP from 1.10 to ~1.45 exactly when the error was
+# largest -- on top of the SHARP_TURN_SPEED blend, which is already injecting
+# turn proportional to that same error. Two error-proportional boosts stacked on
+# one loop drove 73% turn-sign flips over 12 consecutive FOLLOW frames on the
+# 2026-07-30 runs. The blend is the one that has to stay (it is how the robot
+# gets around corners), so this one gives way.
+ADAPTIVE_KP_ERROR_BOOST = 1.0
+ADAPTIVE_KP_CONFIDENCE_DROP = 0.50
+ADAPTIVE_KD_ERROR_BOOST = 1.0
+ADAPTIVE_KD_DERIVATIVE_BOOST = 1.0
 ADAPTIVE_KI_ERROR_REDUCTION = 0.70
 ADAPTIVE_DERIVATIVE_REF = 4.0
 INTEGRAL_LIMIT = 1.2
@@ -19,8 +37,6 @@ STRAIGHT_SPEED_BOOST = 0.10
 CURVE_SPEED_REDUCTION = 0.45
 CURVE_TURN_BOOST = 0.35
 MIN_CURVE_SPEED_SCALE = 0.45
-NEAR_TRAJECTORY_WEIGHT = 0.65
-LOOKAHEAD_TRAJECTORY_WEIGHT = 0.35
 LOOKAHEAD_CONFIDENCE_MIN = 0.25
 RK4_TRAJECTORY_GAIN = 10.0
 RK4_HEADING_GAIN = 8.0
@@ -28,27 +44,40 @@ RK4_MAX_DT = 0.05
 
 # Second RK4 layer: tracks curvature trend between the lookahead and far ROIs,
 # so a closing-out turn can be anticipated before the near ROI ever straightens.
+#
+# CURVATURE_DAMPING = 0.0 disables its contribution. old_working ran ONE RK4 layer
+# and had no far ROI at all; stacking a second predictor on a loop that lost 4x its
+# bandwidth adds phase lag exactly where the oscillation shows up. Re-enable (try
+# 0.3) only once the loop rate is back and the single-layer behaviour is stable.
 FAR_CONFIDENCE_MIN = 0.25
 RK4_CURVATURE_GAIN = 10.0
 RK4_CURVATURE_RATE_GAIN = 8.0
-CURVATURE_DAMPING = 0.6
+CURVATURE_DAMPING = 0.0
 
 # Smooths the discrete error derivative before it feeds the PID/turn-boost math.
-# Raw frame-to-frame derivative of a noisy vision error is the classic cause of
-# oscillation ("swinging") on turns -- this trades a little responsiveness for
-# a lot less overshoot-correct-overshoot.
-DERIVATIVE_SMOOTHING = 0.4
+# Raw frame-to-frame derivative of a noisy vision error is a classic cause of
+# oscillation on turns. Lowered from 0.4: that was chosen for a 120fps loop where
+# smoothing cost little phase, but at the measured ~21fps it lags the one term
+# that could compensate for everything else the loop lost. old_working had none.
+DERIVATIVE_SMOOTHING = 0.80
+# Hard bound on the error derivative fed to the D term, in error-units/second.
+# The observed failure: with the robot yawing, the line sweeps across the image
+# at up to ~4 err/s, the D term saturates (KD*4 = 0.9, beyond TURN_LIMIT) and
+# steering follows the sweep rather than the line -- frame captured at
+# error=+0.035 with turn=-0.800. A genuine tracking error changes well under
+# 1.5 err/s at these speeds, so clamp there; yaw-induced sweeps get cut, real
+# corrections pass through.
+DERIVATIVE_CLAMP = 1.5
 
-# Persistence of vision. The camera is tilted 25 deg forward, so it sees a turn
-# before the wheels reach it. The delay is how long the ground under the near ROI
-# takes to reach the wheels. Derived from fused speed when odometry is healthy,
-# which is why the estimate has to be smooth -- an earlier version computed it
-# from a single raw depth pixel and swung the loop's phase lag 141-450ms frame to
-# frame, which oscillates at any gain.
-VISION_DELAY_S = 0.12
+# Persistence of vision. The camera looks down 22.5 deg from horizontal, so the
+# near ROI is ground ~90mm AHEAD of the wheels: the robot must steer for the
+# line it SAW vision_delay ago, which is what is under the wheels now. At the
+# observed 0.15-0.3 m/s that 90mm takes 0.3-0.6s; 0.35 splits the band. Fixed
+# value -- the odometry-derived variant needs the IMU, which is off on USB-2.
+VISION_DELAY_S = 0.0
 VISION_DELAY_MIN_S = 0.05
-VISION_DELAY_MAX_S = 0.30
-VISION_DELAY_FROM_ODOMETRY = True
+VISION_DELAY_MAX_S = 0.60
+VISION_DELAY_FROM_ODOMETRY = False
 # Reject speeds this far from the previous estimate as flow outliers.
 ODOMETRY_MAX_SPEED_MPS = 1.5
 
@@ -60,7 +89,7 @@ ODOMETRY_MAX_SPEED_MPS = 1.5
 # The complementary filter runs on the IMU and lets flow continuously reset its
 # drift. ODOMETRY_ALPHA is the IMU's weight per fused update: higher = smoother
 # but slower to correct drift.
-ODOMETRY_ENABLED = True
+ODOMETRY_ENABLED = False
 ODOMETRY_ALPHA = 0.85
 # Flow below this is indistinguishable from sensor noise; treat as stopped.
 ODOMETRY_MIN_FLOW_PX = 0.35
@@ -73,7 +102,7 @@ ODOMETRY_MIN_DISTANCE_PX = 12
 ODOMETRY_MIN_TRACKED = 8
 # The D435i IMU is NOT hardware-synced to the frames, so accel samples carry
 # their own timestamps and must be integrated on those, not on frame dt.
-IMU_ENABLED = True
+IMU_ENABLED = False
 IMU_ACCEL_FPS = 200
 IMU_GYRO_FPS = 200
 # Gravity leaks into forward accel whenever the chassis pitches (ramps, speed
@@ -81,24 +110,58 @@ IMU_GYRO_FPS = 200
 IMU_MAX_PITCH_DEV_DEG = 12.0
 
 # SPEEDS
-SHARP_TURN_SPEED = 0.50
+SHARP_TURN_SPEED = 0.70
 MAX_TURN_SPEED = 0.65
-# Negate the turn term on its way to the motors. With the right side no longer
-# mirrored in pi_motors, left = f + t already yaws toward a positive error, so
-# no extra flip is wanted. This was only ever True to compensate for that
-# mirror, which also meant yaw did not depend on the turn term at all.
+# Global governor on forward speed, applied last on the way to the motors. 1.0 is
+# a no-op; lower it for floor testing so a runaway cannot build momentum into a
+# wall. Set via the SPEED_CAP env var so a test run never edits this file.
+SPEED_CAP_SCALE = float(__import__("os").environ.get("SPEED_CAP", "1.0"))
+# Negate the turn term on its way to the motors. False: both sides are inverted
+# in the driver (see LEFT/RIGHT_MOTOR_INVERT), and negating BOTH sides is
+# symmetric -- it reverses forward but leaves the left-right difference, i.e. the
+# yaw, pointing the same way. So the wiring fix needs no steering compensation.
+# Verified against the error sign: err>0 (line right of centre) must yaw right.
 STEER_INVERT = False
-BASE_SPEED = 0.26
-MAX_SPEED = 0.42
+# old_working ran these at 120fps where the loop reacted in ~8ms. At the current
+# ~33ms/frame the robot covers 4x the distance per control decision, and the near
+# ROI only sees ~71-96mm ahead -- at 0.26 base the corner is underneath the robot
+# before the turn slew winds up (measured: clean straight-line FOLLOW streaks that
+# break exactly when turn rails at a corner). Scale speed down with loop rate.
+# The old pivot failure at low BASE_SPEED does not apply anymore: the MIN_SPEED
+# floor is unconditional again, so forward never collapses to zero.
+BASE_SPEED = 0.25
+MAX_SPEED = 0.45
 MIN_SPEED = 0.1
 SPIN_SEARCH_SPEED = 0.32
 APPROACH_SPEED = 0.24
+# Bounds on what the WIDE ROI may treat as a line worth driving toward. Measured
+# on the real mat: a genuine line reads ~33600px there. Below the floor it is a
+# speck or a shadow edge; above the ceiling it is the mat edge or a seam running
+# across the frame. Without these APPROACH accepted anything from 180px up to
+# the 147456px full-ROI guard and drove at it.
+WIDE_MIN_LINE_AREA = 4000
+WIDE_MAX_LINE_AREA = 90000
+# APPROACH runs when the near ROI has already lost the line, i.e. on the robot's
+# least reliable evidence, so it steers gently rather than at the FOLLOW rail.
+APPROACH_TURN_LIMIT = 0.45
 LINE_LOST_STOP_TIMEOUT_S = 4.0
+# How many consecutive near-ROI misses to coast through before believing the
+# line is really gone. The near ROI sees a ~25mm-deep strip of ground, so at
+# BASE_SPEED a single miss is usually the line slipping out of it mid-correction.
+# 3 frames is 100ms at 30fps -- long enough to ride out that, short enough that a
+# genuinely lost line still reaches SPIN_SEARCH promptly.
+LINE_LOST_GRACE_FRAMES = 3
 SLEW_RATE_PER_S = 0.45
 # Turn was previously applied unlimited while forward was slew-limited, so a turn
-# could jump full-scale in one frame. Higher than SLEW_RATE_PER_S because steering
-# must still be responsive.
-TURN_SLEW_RATE_PER_S = 2.5
+# could jump full-scale in one frame.
+#
+# 2.5 was far too slow: at the measured ~25fps it allowed 0.10 of change per frame,
+# so reaching TURN_LIMIT took ~8 frames and the robot understeered through corners.
+# 12.0 was too fast in the other direction -- it let the turn slam between the
+# +/-MAX_TURN_SPEED rails on consecutive frames (22 sign flips in 31 samples).
+# 5.0 crosses the full +/-0.65 range in ~5 frames: fast enough not to understeer,
+# slow enough that one noisy frame cannot reverse the turn.
+TURN_SLEW_RATE_PER_S = 15.0
 # Below this the BTS7960 just buzzes the gearbox without turning it. Commands
 # under the threshold are zeroed rather than scaled up.
 MOTOR_MIN_DUTY = 0.06
@@ -127,17 +190,33 @@ WIDE_ROI_X_START_RATIO = 0.0
 WIDE_ROI_X_END_RATIO = 1.0
 
 # THRESHOLDS
+# Measured inside the running loop on a static scene: frame.min() wanders 9-47
+# as the RealSense re-exposes. A global cut keeps pixels strictly BELOW it, so
+# at 45 the mask went EXACTLY empty on any frame whose darkest pixel reached 45
+# -- 147 of 207 frames reported LINE LOST while parked on the line, which is the
+# FOLLOW/SPIN_SEARCH flapping. 90 is old_working's value and leaves ~45 counts
+# of headroom above the darkest observed pixel.
 BLACK_THRESHOLD = 90
-MIN_LINE_AREA = 45
+# Pixel areas scale with resolution. 45 was tuned at 320x240, so at 640x480 the
+# same real line covers ~4x the pixels: the gate stopped rejecting anything, and
+# line_confidence (area / MIN_LINE_AREA*8) pinned to 1.0 on every frame. That
+# silently disabled LOW_CONFIDENCE_SPEED_SCALE, ADAPTIVE_KP_CONFIDENCE_DROP and
+# both confidence gates -- measured 9700px on a plain straight line.
+MIN_LINE_AREA = 180
+# Area at which line_confidence reaches 1.0. A plain straight line measures
+# ~9700px in the near ROI at 640x480, so full confidence sits a little under
+# that and a half-visible line scores ~0.5 instead of saturating.
+LINE_CONFIDENCE_FULL_AREA = 8000
 PICAMERA2_RGB_TO_BGR = False
 GREEN_DIFF_THRESHOLD = 40
 RED_DIFF_THRESHOLD = 40
-MIN_MARKER_AREA = 40
+MIN_MARKER_AREA = 800
 MARKER_ACTION_DELAY_S = 1.0
 
 # Camera
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
+# Reduced from 30 to 15 so Color + Depth + IMU can all fit over a USB 2.0 cable!
 CAMERA_FPS = 30
 USB_CAMERA_INDEX = 0
 
@@ -163,8 +242,13 @@ RIGHT_EN = 21
 # backwards depends only on how its motor leads are landed -- that is wiring
 # data, which is why it lives beside the pin numbers instead of in the driver.
 # Re-verify with _scratch_sides.py after any rewiring.
-LEFT_MOTOR_INVERT = False
-RIGHT_MOTOR_INVERT = False
+#
+# Both True: observed on the track 2026-07-30 -- a steady forward=+0.24 command
+# with turn~0 drove the robot BACKWARDS, so both sets of motor leads are landed
+# reversed. This is the wiring fact; STEER_INVERT then compensates for the yaw
+# sign that inverting both sides flips (see there).
+LEFT_MOTOR_INVERT = True
+RIGHT_MOTOR_INVERT = True
 
 # pigpio's DMA-timed PWM only offers 18 frequencies, and which ones depend on
 # pigpiod's sample rate (default 5us). 10 kHz is NOT selectable at 5us -- it
@@ -197,7 +281,9 @@ ACCEL_SPEED_DELTA_THRESHOLD = 0.01
 
 # Intersection detection
 INTERSECTION_MIN_CONTOURS = 2
-INTERSECTION_MIN_AREA = 40
+# Also a 320x240-era area: at 640x480 a 40px blob is a speck, so a branch could
+# be declared on noise.
+INTERSECTION_MIN_AREA = 160
 
 # Temporal buffer / backtracking
 MAX_WAYPOINTS = 50
@@ -235,7 +321,13 @@ WARP_MATRIX = [
 # Distances are from the FRONT AXLE, since the drive wheels are at the front.
 # The near edge starts at 60mm because the camera cannot see ground closer than
 # ~58mm at this mount height/tilt.
-BEV_ENABLED = True
+# Disabled while the camera is stuck on a USB-2 link. BEV exists only to give
+# optical flow a metric scale for the speed estimate, and the IMU it fuses with is
+# force-disabled on USB-2 (see camera.py), so the whole chain costs a 400x400
+# warpPerspective plus calcOpticalFlowPyrLK every frame and returns an estimate
+# nothing can trust. Turning it off cut measured loop time from ~46ms to ~33ms.
+# Re-enable together with the USB-3 move.
+BEV_ENABLED = False
 BEV_NEAR_MM = 60.0
 BEV_FAR_MM = 460.0
 BEV_WIDTH_MM = 400.0
@@ -272,7 +364,13 @@ OBSTACLE_MIN_AREA_PX = 400
 # BAND, not a blob. That is a much stronger cue than a per-pixel depth step, and
 # it needs no colour -- which matters because red marks the goal tile and the
 # dead-victim point, not obstacles.
-OBSTACLE_BAND_ENABLED = True
+# Off while the line-following regression is being chased: OBSTACLE_TRIGGER_ON_DROPOUT
+# is False below, so the manoeuvre can never actually fire -- but leaving this True
+# still forces the depth stream on, which costs an rs.align over every 640x480 frame
+# plus a per-column Python scan in detect_obstacle_band. That is pure loop latency
+# in the steering path for a feature that cannot trigger. Re-enable together with
+# OBSTACLE_TRIGGER_ON_DROPOUT once the line following is solid again.
+OBSTACLE_BAND_ENABLED = False
 
 # A downward ray reaches the floor before an obstacle whenever the floor is
 # nearer, so an obstacle does NOT fill its columns -- it is anchored at the top
@@ -293,7 +391,7 @@ OBSTACLE_BAND_MIN_FRAMES = 3
 # once a tracked band's depth vanishes we are at the near limit. Distance is
 # therefore imprecise and preset-dependent -- a deliberate trade for not needing
 # to dead-reckon through the blind zone.
-OBSTACLE_TRIGGER_ON_DROPOUT = True
+OBSTACLE_TRIGGER_ON_DROPOUT = False
 # A band must have been this close before its dropout is trusted, so a band
 # lost to noise at long range does not fire the manoeuvre.
 OBSTACLE_DROPOUT_MAX_RANGE_MM = 320.0

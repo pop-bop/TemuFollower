@@ -8,7 +8,7 @@ from utils import clamp
 
 def draw_debug_view(frame, debug_info, error, turn, left, right, state,
                      extra_lines=None, lookahead_bounds=None, lookahead_point=None,
-                     far_bounds=None, far_point=None):
+                     far_bounds=None, far_point=None, depth_frame=None):
     x0, y0, x1, y1 = map(int, debug_info["roi_bounds"])
     debug = frame.copy()
 
@@ -43,6 +43,12 @@ def draw_debug_view(frame, debug_info, error, turn, left, right, state,
         lines.extend(extra_lines)
     for i, text in enumerate(lines):
         cv2.putText(debug, text, (8, 18 + i * 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+    if depth_frame is not None:
+        import numpy as np
+        # Convert 16-bit depth to 8-bit for display, applying a colormap
+        depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_frame, alpha=0.03), cv2.COLORMAP_JET)
+        debug = np.hstack((debug, depth_colormap))
 
     cv2.imshow("Camera + Decisions", debug)
     cv2.imshow("Black Mask", debug_info["mask"])

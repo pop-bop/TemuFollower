@@ -9,6 +9,7 @@ except ImportError:
 from config import (
     CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, USB_CAMERA_INDEX,
     IMU_ENABLED, IMU_ACCEL_FPS, IMU_GYRO_FPS,
+    OBSTACLE_DETECTION_ENABLED, OBSTACLE_BAND_ENABLED
 )
 
 def _open_usb_camera():
@@ -60,15 +61,13 @@ def open_camera():
         config = rs.config()
 
         config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
-        config.enable_stream(rs.stream.depth, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.z16, CAMERA_FPS)
+        
+        want_depth = True
+        if want_depth:
+            config.enable_stream(rs.stream.depth, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.z16, CAMERA_FPS)
+        else:
+            print("Obstacle detection disabled: skipping depth stream to save USB bandwidth.")
 
-        # The D435 (non-i) has no IMU, so a motion stream request hard-fails the
-        # whole pipeline. Try with motion, then retry without.
-        #
-        # A USB-2 link is the nastier case: depth + color + IMU exceeds its
-        # bandwidth, but the pipeline still STARTS. Frames then never arrive and
-        # wait_for_frames times out far from here, so drop the IMU up front
-        # rather than letting it look like a stream-rate bug.
         want_imu = IMU_ENABLED
         if want_imu:
             usb = None
@@ -77,10 +76,7 @@ def open_camera():
             except Exception:
                 usb = None
             if usb is not None and usb < 3.0:
-                print(f"USB {usb} link: too little bandwidth for depth+color+IMU. "
-                      "Disabling IMU -- move the camera to the blue USB-3 port "
-                      "to get odometry back.")
-                want_imu = False
+                print(f"USB {usb} link detected: Operating at {CAMERA_FPS} FPS to fit Color+Depth+IMU over USB 2.0.")
         if want_imu:
             try:
                 config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, IMU_ACCEL_FPS)
@@ -98,7 +94,8 @@ def open_camera():
                 want_imu = False
                 config = rs.config()
                 config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
-                config.enable_stream(rs.stream.depth, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.z16, CAMERA_FPS)
+                if want_depth:
+                    config.enable_stream(rs.stream.depth, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.z16, CAMERA_FPS)
                 try:
                     profile = pipeline.start(config)
                 except RuntimeError as e2:
@@ -119,6 +116,22 @@ def open_camera():
             depth_sensor = profile.get_device().first_depth_sensor()
             depth_scale = depth_sensor.get_depth_scale()
             intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+
+            # Drain frames until auto-exposure converges. The first frames off
+            # the pipeline are nearly black (measured mean 3.3, climbing to ~120
+            # over ~0.4s), and main.py starts its state machine on them: the
+            # whole ROI thresholds as "line", the centroid is the ROI centre, and
+            # the robot acts on a line that is not there. The USB path already
+            # warmed up 5 frames; this path returned immediately.
+            for _ in range(30):
+                try:
+                    fs = pipeline.wait_for_frames(1000)
+                except RuntimeError:
+                    break
+                c = fs.get_color_frame()
+                if c and np.asanyarray(c.get_data()).mean() > 40.0:
+                    break
+
             print(f"RealSense started. Depth scale: {depth_scale}. Intrinsics: {intrinsics.width}x{intrinsics.height}")
             print(f"IMU: {'enabled' if want_imu else 'disabled'}")
             return "realsense", (pipeline, align, depth_scale, intrinsics, want_imu)
@@ -152,11 +165,11 @@ def read_frame(camera_kind, camera):
         color_frame = aligned_frames.get_color_frame()
         depth_frame = aligned_frames.get_depth_frame()
 
-        if not color_frame or not depth_frame:
+        if not color_frame:
             return None, None
 
         color_image = np.asanyarray(color_frame.get_data())
-        depth_image = np.asanyarray(depth_frame.get_data())
+        depth_image = np.asanyarray(depth_frame.get_data()) if depth_frame else None
 
         return color_image, depth_image
     return None, None
@@ -195,12 +208,12 @@ def read_frame_with_motion(camera_kind, camera):
     aligned_frames = align.process(frames)
     color_frame = aligned_frames.get_color_frame()
     depth_frame = aligned_frames.get_depth_frame()
-    if not color_frame or not depth_frame:
+    if not color_frame:
         return None, None, motion
 
     return (
         np.asanyarray(color_frame.get_data()),
-        np.asanyarray(depth_frame.get_data()),
+        np.asanyarray(depth_frame.get_data()) if depth_frame else None,
         motion,
     )
 
