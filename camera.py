@@ -6,17 +6,30 @@ try:
 except ImportError:
     rs = None
 
-from config import CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, USB_CAMERA_INDEX
+from config import (
+    CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, USB_CAMERA_INDEX,
+    IMU_ENABLED, IMU_ACCEL_FPS, IMU_GYRO_FPS,
+)
 
 def _open_usb_camera():
-    cap = cv2.VideoCapture(USB_CAMERA_INDEX)
+    import sys
+    backend = cv2.CAP_DSHOW if sys.platform.startswith('win') else cv2.CAP_ANY
+    
+    cap = cv2.VideoCapture(USB_CAMERA_INDEX, backend)
     if not cap.isOpened():
-        cap.release()
-        return None
+        # Fallback to default if DSHOW fails
+        cap = cv2.VideoCapture(USB_CAMERA_INDEX)
+        if not cap.isOpened():
+            return None
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) # FIX JITTER: Disable OpenCV frame buffering
+
+    # Warm up the camera
+    for _ in range(5):
+        cap.read()
 
     ok, _ = cap.read()
     if not ok:
@@ -37,11 +50,36 @@ def open_camera():
         config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
         config.enable_stream(rs.stream.depth, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.z16, CAMERA_FPS)
 
+        # The D435 (non-i) has no IMU, so a motion stream request hard-fails the
+        # whole pipeline. Try with motion, then retry without.
+        want_imu = IMU_ENABLED
+        if want_imu:
+            try:
+                config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, IMU_ACCEL_FPS)
+                config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, IMU_GYRO_FPS)
+            except RuntimeError as e:
+                print(f"IMU streams unavailable ({e}); continuing without.")
+                want_imu = False
+
+        profile = None
         try:
             profile = pipeline.start(config)
         except RuntimeError as e:
+            if want_imu:
+                print(f"Start failed with IMU enabled ({e}); retrying without IMU.")
+                want_imu = False
+                config = rs.config()
+                config.enable_stream(rs.stream.color, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.bgr8, CAMERA_FPS)
+                config.enable_stream(rs.stream.depth, CAMERA_WIDTH, CAMERA_HEIGHT, rs.format.z16, CAMERA_FPS)
+                try:
+                    profile = pipeline.start(config)
+                except RuntimeError as e2:
+                    e = e2
+
+        if profile is None:
             print(f"Requested configuration ({CAMERA_WIDTH}x{CAMERA_HEIGHT} @ {CAMERA_FPS} FPS) not supported: {e}")
             print("Falling back to default camera configuration.")
+            want_imu = False
             try:
                 profile = pipeline.start()
             except RuntimeError as e2:
@@ -54,7 +92,8 @@ def open_camera():
             depth_scale = depth_sensor.get_depth_scale()
             intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
             print(f"RealSense started. Depth scale: {depth_scale}. Intrinsics: {intrinsics.width}x{intrinsics.height}")
-            return "realsense", (pipeline, align, depth_scale, intrinsics)
+            print(f"IMU: {'enabled' if want_imu else 'disabled'}")
+            return "realsense", (pipeline, align, depth_scale, intrinsics, want_imu)
     else:
         print("pyrealsense2 not available.")
 
@@ -78,7 +117,7 @@ def read_frame(camera_kind, camera):
             return None, None
         return color_image, None
     elif camera_kind == "realsense":
-        pipeline, align, _, _ = camera
+        pipeline, align = camera[0], camera[1]
         frames = pipeline.wait_for_frames()
         aligned_frames = align.process(frames)
 
@@ -94,14 +133,60 @@ def read_frame(camera_kind, camera):
         return color_image, depth_image
     return None, None
 
+
+def read_frame_with_motion(camera_kind, camera):
+    """Frame plus any IMU samples that arrived with it.
+
+    Returns (color, depth, motion) where motion is a list of
+    ('accel'|'gyro', (x, y, z), timestamp_s). The D435i IMU is not
+    hardware-synced to the frames, so each sample carries its own device
+    timestamp and must be integrated on that, not on frame dt.
+    """
+    if camera_kind != "realsense" or not isinstance(camera, tuple):
+        color, depth = read_frame(camera_kind, camera)
+        return color, depth, []
+
+    pipeline, align = camera[0], camera[1]
+    imu_on = camera[4] if len(camera) > 4 else False
+
+    frames = pipeline.wait_for_frames()
+
+    motion = []
+    if imu_on:
+        for f in frames:
+            m = f.as_motion_frame()
+            if not m:
+                continue
+            d = m.get_motion_data()
+            prof = m.get_profile().stream_type()
+            kind = "accel" if prof == rs.stream.accel else "gyro"
+            # Device timestamps are milliseconds.
+            motion.append((kind, (d.x, d.y, d.z), m.get_timestamp() / 1000.0))
+        motion.sort(key=lambda s: s[2])
+
+    aligned_frames = align.process(frames)
+    color_frame = aligned_frames.get_color_frame()
+    depth_frame = aligned_frames.get_depth_frame()
+    if not color_frame or not depth_frame:
+        return None, None, motion
+
+    return (
+        np.asanyarray(color_frame.get_data()),
+        np.asanyarray(depth_frame.get_data()),
+        motion,
+    )
+
+
+def has_imu(camera):
+    return isinstance(camera, tuple) and len(camera) > 4 and bool(camera[4])
+
+
 def get_intrinsics(camera):
     if not isinstance(camera, tuple):
         return None
-    _, _, _, intrinsics = camera
-    return intrinsics
+    return camera[3]
 
 def get_depth_scale(camera):
     if not isinstance(camera, tuple):
         return 0.001 # standard 1mm default
-    _, _, depth_scale, _ = camera
-    return depth_scale
+    return camera[2]

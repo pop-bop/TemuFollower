@@ -1,7 +1,7 @@
 # PID
-KP = 1.10
-KI = 0.00
-KD = 0.18
+KP = 0.95
+KI = 0.01
+KD = 0.15
 TURN_LIMIT = 0.80
 CENTER_DEADZONE = 0.12
 ADAPTIVE_PID_ENABLED = True
@@ -39,12 +39,46 @@ CURVATURE_DAMPING = 0.6
 # a lot less overshoot-correct-overshoot.
 DERIVATIVE_SMOOTHING = 0.4
 
-# Persistence of vision. The camera is mounted tilted 25 deg forward, so it sees a
-# turn before the wheels reach it. The error observed now is held for the travel
-# time to that ground patch and only then steered on. Bounded so a bad depth
-# sample or a near-stopped robot can't stall or spike the delay.
-VISION_DELAY_MIN_S = 0.0
-VISION_DELAY_MAX_S = 0.45
+# Persistence of vision. The camera is tilted 25 deg forward, so it sees a turn
+# before the wheels reach it. The delay is how long the ground under the near ROI
+# takes to reach the wheels. Derived from fused speed when odometry is healthy,
+# which is why the estimate has to be smooth -- an earlier version computed it
+# from a single raw depth pixel and swung the loop's phase lag 141-450ms frame to
+# frame, which oscillates at any gain.
+VISION_DELAY_S = 0.12
+VISION_DELAY_MIN_S = 0.05
+VISION_DELAY_MAX_S = 0.30
+VISION_DELAY_FROM_ODOMETRY = True
+# Reject speeds this far from the previous estimate as flow outliers.
+ODOMETRY_MAX_SPEED_MPS = 1.5
+
+# --- Speed estimation: IMU + visual odometry -------------------------------
+# There are no wheel encoders, so absolute speed comes from fusing two sources
+# with opposite failure modes:
+#   * IMU accel integrates at ~200Hz but drifts within seconds
+#   * BEV optical flow is drift-free and absolute but noisy at ~30Hz
+# The complementary filter runs on the IMU and lets flow continuously reset its
+# drift. ODOMETRY_ALPHA is the IMU's weight per fused update: higher = smoother
+# but slower to correct drift.
+ODOMETRY_ENABLED = True
+ODOMETRY_ALPHA = 0.85
+# Flow below this is indistinguishable from sensor noise; treat as stopped.
+ODOMETRY_MIN_FLOW_PX = 0.35
+# Track points for flow. Fewer is faster; the floor is low-texture so don't
+# expect many good corners.
+ODOMETRY_MAX_CORNERS = 120
+ODOMETRY_QUALITY = 0.02
+ODOMETRY_MIN_DISTANCE_PX = 12
+# Discard the frame's flow if fewer than this many points survive tracking.
+ODOMETRY_MIN_TRACKED = 8
+# The D435i IMU is NOT hardware-synced to the frames, so accel samples carry
+# their own timestamps and must be integrated on those, not on frame dt.
+IMU_ENABLED = True
+IMU_ACCEL_FPS = 250
+IMU_GYRO_FPS = 200
+# Gravity leaks into forward accel whenever the chassis pitches (ramps, speed
+# bumps). Above this the accel sample is distrusted and flow carries the estimate.
+IMU_MAX_PITCH_DEV_DEG = 12.0
 
 # SPEEDS
 SHARP_TURN_SPEED = 0.50
@@ -57,6 +91,17 @@ SPIN_SEARCH_SPEED = 0.32
 APPROACH_SPEED = 0.24
 LINE_LOST_STOP_TIMEOUT_S = 4.0
 SLEW_RATE_PER_S = 0.45
+# Turn was previously applied unlimited while forward was slew-limited, so a turn
+# could jump full-scale in one frame. Higher than SLEW_RATE_PER_S because steering
+# must still be responsive.
+TURN_SLEW_RATE_PER_S = 2.5
+# Below this the BTS7960 just buzzes the gearbox without turning it. Commands
+# under the threshold are zeroed rather than scaled up.
+MOTOR_MIN_DUTY = 0.06
+# A wheel must be commanded past this magnitude in the opposite direction before
+# its H-bridge direction bit flips. Without it, a near-zero inner-wheel command
+# toggles direction every frame and the driver slams forward/reverse.
+MOTOR_DIR_FLIP_HYSTERESIS = 0.05
 MANUAL_SPEED = 0.22
 MANUAL_KEY_TIMEOUT_S = 0.5
 
@@ -92,19 +137,49 @@ CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
 USB_CAMERA_INDEX = 0
 
-# Motor pins
-LEFT_ENA = 12
-LEFT_IN1 = 16
-LEFT_IN2 = 20
-RIGHT_ENB = 18
-RIGHT_IN3 = 21
-RIGHT_IN4 = 26
-PWM_FREQUENCY_HZ = 1000
+# "pi" drives the bridges from Pi GPIO via pigpio; "uart" keeps the old ESP32
+# hop; "auto" prefers pi and falls back to uart if pigpio/pigpiod is missing.
+MOTOR_BACKEND = "auto"
 
-# Indicator pins
-RED_LED_PIN = 5
-GREEN_LED_PIN = 6
-BUZZER_PIN = 13
+# Motor pins (BCM numbering) -- RPi drives the two IBT-2/BTS7960 boards directly.
+# Each board takes an LPWM/RPWM pair rather than the L298N ENA+IN1+IN2 triple:
+# to drive a side you PWM one input and hold the other at 0.
+#
+# All chosen pins are in BCM 9-27, which default to pull-DOWN, so the bridges
+# read LOW through boot before any code runs. Pins 0-8 default HIGH and must
+# never be used here. SPI0 (7-11), I2C1 (2,3) and the UART console (14,15) are
+# left free.
+#
+# 12/18 share hardware PWM0 and 13/19 share PWM1, so the four cannot all be
+# independent hardware channels at once. That is fine: only one input per side
+# is ever non-zero, so at most two are live simultaneously.
+LEFT_LPWM = 13
+LEFT_RPWM = 12
+RIGHT_LPWM = 19
+RIGHT_RPWM = 18
+
+# R_EN/L_EN on each board. Tie both of a board's enables to one Pi pin. Set to
+# None if you have strapped them to +5V in hardware instead.
+LEFT_EN = 20
+RIGHT_EN = 21
+
+# 20 kHz would be inaudible, but pigpio's DMA-timed PWM only resolves
+# 1e6/(sample_us * freq) duty steps -- 50 at 20 kHz, too coarse to steer with.
+# 10 kHz gives 100 steps. Pins that get a real hardware channel are driven via
+# hardware_PWM() and are not subject to this limit.
+PWM_FREQUENCY_HZ = 10000
+
+# Cut the motors if the control loop stops feeding commands. With no
+# microcontroller latching state, a crashed process would otherwise leave the
+# last duty applied indefinitely.
+MOTOR_COMMAND_TIMEOUT_S = 0.3
+
+# Indicator pins. Moved off BCM 5/6/13: 13 collided with LEFT_LPWM, and 5/6 sit
+# in the pull-UP bank so an LED would glow through boot.
+STATUS_LED_PIN = 26
+RED_LED_PIN = 22
+GREEN_LED_PIN = 23
+BUZZER_PIN = 24
 
 # Acceleration buzzer
 ACCEL_BUZZER_ENABLED = True
@@ -126,7 +201,9 @@ INTERSECTION_MEMORY_MAX_AGE_S = 60.0
 ROTATE_SETTLE_TIME_S = 0.25
 
 # Debug
-SHOW_DEBUG_VIEW = True
+# Two imshow windows per frame on the Pi inflates and destabilises loop dt, which
+# directly scales the PID derivative term. Turn off when tuning motion.
+SHOW_DEBUG_VIEW = False
 DEBUG_VIEW_EVERY_N_FRAMES = 2
 LOOP_LOG_INTERVAL_S = 0.20
 ROI_VIEW_SCALE = 3
@@ -134,7 +211,7 @@ ARROW_MAX_DEFLECTION_DEG = 65.0
 
 # RealSense & Perspective Configs
 CAMERA_TILT_ANGLE_DEG = 25.0
-CAMERA_MOUNT_HEIGHT_MM = 150.0
+CAMERA_MOUNT_HEIGHT_MM = 60.0
 
 WARP_MATRIX = [
     [1.0, 0.0, 0.0],
@@ -142,8 +219,43 @@ WARP_MATRIX = [
     [0.0, 0.0, 1.0]
 ]
 
+# Bird's-eye ground patch. Rectifying to a known metric rectangle makes ROI rows
+# true distances instead of image ratios, and makes optical flow metrically
+# scaled for free (see BEV_MM_PER_PX) -- which is how a monocular camera gets an
+# absolute speed without encoders.
+#
+# Distances are from the FRONT AXLE, since the drive wheels are at the front.
+# The near edge starts at 60mm because the camera cannot see ground closer than
+# ~58mm at this mount height/tilt.
+BEV_ENABLED = True
+BEV_NEAR_MM = 60.0
+BEV_FAR_MM = 460.0
+BEV_WIDTH_MM = 400.0
+BEV_OUTPUT_PX = 400
+BEV_MM_PER_PX = BEV_WIDTH_MM / BEV_OUTPUT_PX
+# Camera optical centre offset from the robot centreline, +ve = mounted right.
+BEV_CAMERA_X_OFFSET_MM = 0.0
+# Forward gap from the front axle to the camera lens. The near ROI images ground
+# only ~71-96mm ahead of the LENS, so if the lens sits ahead of the axle that
+# patch is nearly under the wheels already.
+BEV_CAMERA_AXLE_OFFSET_MM = 0.0
+# Saved by calibrate_bev.py; overrides the analytic derivation when present.
+BEV_CALIBRATION_FILE = "bev_calibration.json"
+
 # Obstacle Detection
 GROUND_DEPTH_TOLERANCE_MM = 40.0 # Anything closer by this amount is an obstacle
+# Disabled: at CAMERA_MOUNT_HEIGHT_MM=60 the near ROI images ground only 71-96mm
+# ahead, inside the D435i minimum-depth blind zone (~105mm+), so depth there is 0
+# or garbage. The mask was flagging every ground pixel as an obstacle, erasing the
+# line and flapping a hard +/-0.6 steering offset at frame rate. Re-enabling needs
+# a higher camera mount, not a bigger tolerance.
+OBSTACLE_DETECTION_ENABLED = False
+# Competition obstacles are >=15cm high (RescueLine rules 3.5.4) and have NO
+# specified colour -- red marks the goal tile and the dead-victim point instead,
+# so colour must not be used as the obstacle cue. A 150mm object is ~2.5x the
+# camera height: a large depth step, well outside the near-field blind zone.
+OBSTACLE_MIN_HEIGHT_MM = 100.0
+OBSTACLE_MIN_AREA_PX = 400
 
 # SPI Configuration
 SPI_BUS = 0

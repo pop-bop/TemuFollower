@@ -29,7 +29,6 @@ class TemporalBuffer:
             "branches": branch_memory,
             "chosen_branch_idx": chosen_branch_idx,
             "dead_end": False,
-            "frame": frame.copy() if frame is not None else None,
         }
         self.waypoints.append(wp)
         if len(self.waypoints) > self.max_size:

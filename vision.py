@@ -10,7 +10,7 @@ from config import (
     WIDE_ROI_Y_START_RATIO, WIDE_ROI_X_START_RATIO, WIDE_ROI_X_END_RATIO,
     BLACK_THRESHOLD, MIN_LINE_AREA, GREEN_DIFF_THRESHOLD, RED_DIFF_THRESHOLD,
     MIN_MARKER_AREA, INTERSECTION_MIN_AREA, INTERSECTION_MIN_CONTOURS,
-    WARP_MATRIX, GROUND_DEPTH_TOLERANCE_MM
+    WARP_MATRIX, GROUND_DEPTH_TOLERANCE_MM, OBSTACLE_DETECTION_ENABLED
 )
 from utils import clamp
 
@@ -21,21 +21,22 @@ def warp_frame(frame, M):
     h, w = frame.shape[:2]
     return cv2.warpPerspective(frame, M, (w, h))
 
-def get_expected_depth_map(w, h, tilt_deg, height_mm):
+def get_expected_depth_map(w, h, tilt_deg, height_mm, vfov_deg=42.0):
     expected = np.zeros((h, w), dtype=np.float32)
-    fov_y = 60.0 * np.pi / 180.0
+    fov_y = vfov_deg * np.pi / 180.0
     tilt_rad = tilt_deg * np.pi / 180.0
-    for y in range(h):
-        ny = (y - h/2.0) / (h/2.0)
-        # Rows lower in the image (ny > 0) look further DOWN, so they strike the
-        # ground nearer the robot. The depression angle therefore grows with ny.
-        angle = tilt_rad + ny * (fov_y/2.0)
-        if angle <= 0.05:
-            angle = 0.05
-        expected[y, :] = height_mm / np.sin(angle)
+    # Vectorised over rows; every column in a row shares a depression angle, which
+    # ignores horizontal FOV and so is only an approximation near the frame edges.
+    ny = (np.arange(h, dtype=np.float32) - h / 2.0) / (h / 2.0)
+    # Rows lower in the image (ny > 0) look further DOWN, so they strike the
+    # ground nearer the robot. The depression angle therefore grows with ny.
+    angle = np.maximum(tilt_rad + ny * (fov_y / 2.0), 0.05)
+    expected[:] = (height_mm / np.sin(angle))[:, None]
     return expected
 
 def get_obstacle_mask(depth_frame, depth_scale, expected_map):
+    if not OBSTACLE_DETECTION_ENABLED:
+        return None
     depth_mm = depth_frame * (depth_scale * 1000.0)
     obs = (expected_map - depth_mm) > GROUND_DEPTH_TOLERANCE_MM
     obs = obs & (depth_mm > 0)
@@ -123,15 +124,16 @@ def find_line_error(frame, obstacle_mask, y_start_ratio, y_end_ratio, x_start_ra
     center_x_global = x0 + roi_w // 2
     error = (cx_global - center_x_global) / max(1.0, roi_w / 2.0)
 
-    # Obstacle avoidance: offset error to avoid blocks
-    if cv2.countNonZero(obs_roi) > 0:
+    # Obstacle avoidance: steer away from blocks. The offset scales with how far
+    # off-centre the obstacle is; a binary +/-0.6 flapped sign every frame whenever
+    # the obstacle centroid sat near the ROI midline.
+    obs_pixels = cv2.countNonZero(obs_roi)
+    if obs_pixels > 0:
         obs_m = cv2.moments(obs_roi)
         if obs_m["m00"] > 0:
-            obs_cx = int(obs_m["m10"] / obs_m["m00"])
-            if obs_cx > roi_w // 2:
-                error -= 0.6
-            else:
-                error += 0.6
+            obs_cx = obs_m["m10"] / obs_m["m00"]
+            obs_offset = (obs_cx - roi_w / 2.0) / max(1.0, roi_w / 2.0)
+            error -= 0.6 * clamp(obs_offset, -1.0, 1.0)
 
     debug_info["line_point"] = (cx_global, cy_global)
     return clamp(error, -1.0, 1.0), debug_info

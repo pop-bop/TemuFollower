@@ -20,18 +20,23 @@ from config import (
     BACKTRACK_SPEED, ROTATE_SPEED, BACKTRACK_SEARCH_TIMEOUT_S,
     INTERSECTION_COOLDOWN_S, INTERSECTION_MEMORY_MAX_AGE_S,
     MAX_WAYPOINTS, ROI_X_START_RATIO, ROI_X_END_RATIO, ROTATE_SETTLE_TIME_S,
-    VISION_DELAY_MIN_S, VISION_DELAY_MAX_S,
+    VISION_DELAY_S, TURN_SLEW_RATE_PER_S,
+    VISION_DELAY_MIN_S, VISION_DELAY_MAX_S, VISION_DELAY_FROM_ODOMETRY,
+    ODOMETRY_ENABLED, BEV_ENABLED, BEV_NEAR_MM, BEV_CAMERA_AXLE_OFFSET_MM,
 )
-from camera import open_camera, read_frame
+from camera import (
+    open_camera, read_frame, read_frame_with_motion, has_imu, get_intrinsics,
+)
 from vision import (
     find_line_error_normal, find_line_error_lookahead, find_line_error_far,
     find_line_error_wide, print_calibration_info, detect_intersection_normal,
 )
 from uart_master import UARTMaster
 from motors import RobotMotors
+from pi_motors import create_motors
 from vision import get_warp_matrix, warp_frame, get_expected_depth_map, get_obstacle_mask
 from camera import get_depth_scale
-from config import CAMERA_TILT_ANGLE_DEG, CAMERA_MOUNT_HEIGHT_MM
+from config import CAMERA_TILT_ANGLE_DEG, CAMERA_MOUNT_HEIGHT_MM, OBSTACLE_DETECTION_ENABLED
 
 def slew_toward(current, target, max_step):
     if target > current: return min(target, current + max_step)
@@ -44,13 +49,30 @@ from adaptive_pid import schedule_pid_gains
 from trajectory import (
     new_trajectory_state, reset_trajectory_state, rk4_step, rk4_step_curvature,
 )
+import bev
+from odometry import SpeedEstimator
+
+
+def odometry_vision_delay(speed_mps):
+    """How long ground under the near ROI takes to reach the drive wheels.
+
+    Returns None when speed is too low to divide by, so the caller keeps the
+    fixed fallback. The drive wheels are at the FRONT of the chassis, so the
+    distance to cover is the near-ROI edge less any lens-ahead-of-axle offset.
+    """
+    if speed_mps < 0.05:
+        return None
+    distance_mm = max(0.0, BEV_NEAR_MM - BEV_CAMERA_AXLE_OFFSET_MM)
+    return clamp(
+        (distance_mm / 1000.0) / speed_mps,
+        VISION_DELAY_MIN_S, VISION_DELAY_MAX_S,
+    )
 
 
 def main():
     camera_kind, camera = open_camera()
     depth_scale = get_depth_scale(camera)
-    uart = UARTMaster()
-    motors = RobotMotors(uart)
+    motors, close_motors = create_motors()
     warp_M = get_warp_matrix()
     expected_depth_map = None
 
@@ -61,10 +83,30 @@ def main():
         warped = warp_frame(first_color, warp_M)
         print_calibration_info(warped)
 
+    # Bird's-eye rectification gives the ground patch a known mm/px scale, which
+    # is what makes optical flow a metric speed measurement rather than a
+    # scale-ambiguous one.
+    bev_M = None
+    bev_size = None
+    bev_mask = None
+    if BEV_ENABLED and first_color is not None:
+        bev_M, bev_size = bev.load_bev_matrix(get_intrinsics(camera))
+        if bev_M is not None:
+            bev_mask = bev.bev_validity_mask(bev_M, bev_size, first_color.shape)
+
+    speed_estimator = SpeedEstimator() if ODOMETRY_ENABLED else None
+    imu_available = has_imu(camera)
+    odometry_ready = speed_estimator is not None and bev_M is not None
+    if ODOMETRY_ENABLED and not odometry_ready:
+        print("Odometry: BEV unavailable, falling back to fixed vision delay.")
+    vision_delay = VISION_DELAY_S
+    last_bev_time = None
+
     integral = 0.0
     last_error = 0.0
     last_time = time.perf_counter()
     applied_forward = 0.0
+    applied_turn = 0.0
     state = "FOLLOW"
     spin_start_time = None
     search_direction = 1.0
@@ -110,6 +152,7 @@ def main():
             dt = max(0.001, now - last_time)
             last_time = now
             max_step = SLEW_RATE_PER_S * dt
+            max_turn_step = TURN_SLEW_RATE_PER_S * dt
             frame_count += 1
             instant_fps = 1.0 / dt
             fps_ema = instant_fps if fps_ema <= 0.0 else (fps_ema * 0.9) + (instant_fps * 0.1)
@@ -122,6 +165,7 @@ def main():
                         print("SWITCHED TO MANUAL: use w/a/s/d, space=stop, enter=back to auto")
                     mode = "MANUAL"
                     applied_forward = 0.0
+                    applied_turn = 0.0
                     last_manual_command = None
                     pending_marker_color = None
                     pending_marker_action_time = None
@@ -144,6 +188,7 @@ def main():
                     mode = "AUTO"
                     state = "FOLLOW"
                     applied_forward = 0.0
+                    applied_turn = 0.0
                     integral = 0.0
                     last_error = 0.0
                     pending_marker_color = None
@@ -178,17 +223,44 @@ def main():
                     pass
                     print("BUZZER manual test tone")
 
-            color_frame, depth_frame = read_frame(camera_kind, camera)
+            color_frame, depth_frame, motion_samples = read_frame_with_motion(
+                camera_kind, camera
+            )
             if color_frame is None:
                 continue
 
+            if speed_estimator is not None:
+                # IMU samples carry their own device timestamps because the
+                # D435i motion stream is not hardware-synced to the frames.
+                for kind, xyz, ts in motion_samples:
+                    if kind == "accel":
+                        speed_estimator.add_imu_accel(xyz, ts)
+                    else:
+                        speed_estimator.add_imu_gyro(xyz)
+
+                if bev_M is not None:
+                    bev_gray = cv2.cvtColor(
+                        bev.warp_to_bev(color_frame, bev_M, bev_size), cv2.COLOR_BGR2GRAY
+                    )
+                    bev_dt = 0.0 if last_bev_time is None else now - last_bev_time
+                    last_bev_time = now
+                    speed_estimator.update_vision(bev_gray, bev_dt, bev_mask)
+
+                if not imu_available and speed_estimator.confidence <= 0.0:
+                    # No IMU and no usable flow: nothing measures speed, so fall
+                    # back to the commanded duty rather than trusting a stale value.
+                    speed_estimator.fallback_from_command(applied_forward)
+
+                if VISION_DELAY_FROM_ODOMETRY and odometry_ready:
+                    derived = odometry_vision_delay(speed_estimator.speed_mps)
+                    vision_delay = VISION_DELAY_S if derived is None else derived
+
             frame = warp_frame(color_frame, warp_M)
-            warped_depth = None
-            if expected_depth_map is not None and depth_frame is not None:
-                warped_depth = warp_frame(depth_frame, warp_M)
-                obstacle_mask = get_obstacle_mask(warped_depth, depth_scale, expected_depth_map)
-            else:
-                obstacle_mask = None
+            obstacle_mask = None
+            if OBSTACLE_DETECTION_ENABLED and expected_depth_map is not None and depth_frame is not None:
+                obstacle_mask = get_obstacle_mask(
+                    warp_frame(depth_frame, warp_M), depth_scale, expected_depth_map,
+                )
 
             if halted:
                 motors.stop()
@@ -220,10 +292,15 @@ def main():
                     state = "MANUAL IDLE"
 
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
-                turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
+                turn_component = slew_toward(
+                    applied_turn,
+                    clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED),
+                    max_turn_step,
+                )
+                applied_turn = turn_component
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
-                
+
                 motors.set_speeds(applied_left, applied_right)
 
                 current_speed_mag = abs(applied_forward)
@@ -422,13 +499,12 @@ def main():
                 # closing out -- damp the turn boost pre-emptively instead of
                 # waiting for the near ROI to straighten and overshooting the
                 # correction (a common cause of oscillation on exits).
-                closing_out = (predicted_curvature_rate * predicted_heading) < 0.0
-                curvature_damping = 1.0
-                if closing_out:
-                    curvature_damping = clamp(
-                        1.0 - CURVATURE_DAMPING * clamp(abs(predicted_curvature_rate), 0.0, 1.0),
-                        0.0, 1.0,
-                    )
+                # Applied continuously rather than as a sign test: a binary switch
+                # on the product of two noisy estimates toggled at frame rate.
+                closing_amount = clamp(
+                    -predicted_curvature_rate * predicted_heading, 0.0, 1.0,
+                )
+                curvature_damping = clamp(1.0 - CURVATURE_DAMPING * closing_amount, 0.0, 1.0)
 
                 curve_speed_scale = clamp(
                     1.0 - CURVE_SPEED_REDUCTION * curve_sharpness,
@@ -446,36 +522,16 @@ def main():
                 derivative = smoothed_derivative
                 last_error = future_error
 
-                # Account for camera look-ahead distance using Intel depth ROI
-                cx, cy = normal_debug.get("line_point") or (frame.shape[1]//2, frame.shape[0]//2)
-                cy = int(clamp(cy, 0, frame.shape[0] - 1))
-                cx = int(clamp(cx, 0, frame.shape[1] - 1))
-                
-                depth_mm = 300.0
-                if warped_depth is not None:
-                    depth_mm = warped_depth[cy, cx] * (depth_scale * 1000.0)
-                    if depth_mm <= 0 and expected_depth_map is not None: 
-                        depth_mm = expected_depth_map[cy, cx]
-                elif expected_depth_map is not None:
-                    depth_mm = expected_depth_map[cy, cx]
-
-                distance_m = max(depth_mm / 1000.0, 0.1)
-
-                # Estimate speed in m/s (assuming applied_forward 1.0 ≈ 1.2 m/s top speed)
-                current_speed_mps = max(abs(applied_forward) * 1.2, 0.1)
-
-                # Persistence of vision: the camera is tilted 25 deg forward, so the
-                # ROI centroid is ground the wheels only reach t_ahead seconds later.
-                # Delay the observed error by that travel time instead of scaling it
-                # by distance -- a distance multiply swings with every centroid row
-                # change and is a direct jitter source.
-                t_ahead = clamp(
-                    distance_m / current_speed_mps,
-                    VISION_DELAY_MIN_S, VISION_DELAY_MAX_S,
-                )
-
+                # Persistence of vision: the camera is tilted forward, so the ROI
+                # centroid is ground the wheels only reach vision_delay later.
+                # An earlier version derived this from a single raw depth pixel
+                # inside the sensor's blind zone and swung the loop's phase lag
+                # 141-450ms frame to frame, which oscillates at any gain. It is
+                # now derived from FUSED speed, which is smooth and clamped to
+                # [VISION_DELAY_MIN_S, VISION_DELAY_MAX_S], and falls back to the
+                # fixed VISION_DELAY_S whenever odometry is unhealthy.
                 vision_delay_queue.append((now, future_error))
-                while len(vision_delay_queue) > 1 and (now - vision_delay_queue[1][0]) >= t_ahead:
+                while len(vision_delay_queue) > 1 and (now - vision_delay_queue[1][0]) >= vision_delay:
                     vision_delay_queue.popleft()
                 error = clamp(vision_delay_queue[0][1], -1.0, 1.0)
                 
@@ -635,15 +691,21 @@ def main():
             if state == "STOP":
                 motors.stop()
                 applied_forward = 0.0
+                applied_turn = 0.0
                 applied_left = 0.0
                 applied_right = 0.0
                 display_turn = 0.0
                 turn_component = 0.0
             else:
                 applied_forward = slew_toward(applied_forward, target_forward, max_step)
-                
+
                 # Update visual variables for debug UI
-                turn_component = clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED)
+                turn_component = slew_toward(
+                    applied_turn,
+                    clamp(target_turn, -MAX_TURN_SPEED, MAX_TURN_SPEED),
+                    max_turn_step,
+                )
+                applied_turn = turn_component
                 applied_left = clamp(applied_forward + turn_component, -1.0, 1.0)
                 applied_right = clamp(applied_forward - turn_component, -1.0, 1.0)
                 motors.set_speeds(applied_left, applied_right)
@@ -677,18 +739,24 @@ def main():
             if now - last_log_time >= LOOP_LOG_INTERVAL_S:
                 last_log_time = now
                 loop_ms = dt * 1000.0
+                if speed_estimator is not None:
+                    odo = (f" v={speed_estimator.speed_mps:.2f}m/s"
+                           f"({speed_estimator.source},c={speed_estimator.confidence:.2f})"
+                           f" vdel={vision_delay*1000:.0f}ms")
+                else:
+                    odo = ""
                 print(
                     f"state={state:12s} forward={applied_forward:+.2f} turn={turn_component:+.2f}  "
                     f"L/R={applied_left:+.2f}/{applied_right:+.2f}  loop_ms={loop_ms:.1f} "
                     f"fps={fps_ema:.1f} pid={current_kp:.2f}/{current_ki:.2f}/{current_kd:.2f} "
-                    f"curve={curve_sharpness:.2f}/{curve_speed_scale:.2f}"
+                    f"curve={curve_sharpness:.2f}/{curve_speed_scale:.2f}{odo}"
                 )
     except KeyboardInterrupt:
         print("stopping")
 
     finally:
         motors.stop()
-        uart.close()
+        close_motors()
         if camera_kind == "picamera2":
             camera.stop()
         elif camera_kind == "realsense":

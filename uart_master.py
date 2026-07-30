@@ -21,8 +21,11 @@ class UARTMaster:
             return
         packet = build_packet(cmd_id, payload)
         try:
+            # The ESP32 sends unsolicited status/IMU frames. Nothing reads them, so
+            # without this the OS input buffer fills and eventually blocks writes.
+            if self.ser.in_waiting:
+                self.ser.reset_input_buffer()
             self.ser.write(packet)
-            self.ser.flush()
         except serial.SerialException as e:
             print(f"UART write failed: {e}")
             self.ser = None
