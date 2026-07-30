@@ -13,6 +13,7 @@ from config import (
     LEFT_LPWM, LEFT_RPWM, RIGHT_LPWM, RIGHT_RPWM,
     LEFT_EN, RIGHT_EN, PWM_FREQUENCY_HZ, MOTOR_COMMAND_TIMEOUT_S,
     MOTOR_MIN_DUTY, MOTOR_DIR_FLIP_HYSTERESIS,
+    LEFT_MOTOR_INVERT, RIGHT_MOTOR_INVERT,
 )
 from utils import clamp
 
@@ -24,6 +25,7 @@ except ImportError:
 _PWM_RANGE = 255
 
 
+import atexit
 class PiMotorDriver:
     """Low-level pin driver. Owns the pigpio handle and the failsafe watchdog."""
 
@@ -61,6 +63,7 @@ class PiMotorDriver:
         self._closed = False
         self._watchdog = threading.Thread(target=self._watch, daemon=True)
         self._watchdog.start()
+        atexit.register(self.close)
 
     def _write(self, pin, duty):
         """duty is 0.._PWM_RANGE.
@@ -175,12 +178,17 @@ class PiRobotMotors:
         left = clamp(left, -1.0, 1.0)
         right = clamp(right, -1.0, 1.0)
 
-        # Hardware mapping: the right motor is mirrored, so invert its direction
-        # to keep positive 'right' meaning forward.
-        actual_right = -right
+        # Apply wiring polarity to the signed value, before anything is derived
+        # from it. The previous code negated only the copy used for the
+        # direction bit while the magnitude kept the original sign, so a side
+        # ran backwards at the right speed: forward and turn came out swapped.
+        if LEFT_MOTOR_INVERT:
+            left = -left
+        if RIGHT_MOTOR_INVERT:
+            right = -right
 
         self._left_reversed = self._resolve_direction(left, self._left_reversed)
-        self._right_reversed = self._resolve_direction(actual_right, self._right_reversed)
+        self._right_reversed = self._resolve_direction(right, self._right_reversed)
 
         # Below MOTOR_MIN_DUTY the bridge only buzzes the gearbox.
         left_mag = abs(left) if abs(left) >= MOTOR_MIN_DUTY else 0.0

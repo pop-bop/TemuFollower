@@ -74,7 +74,7 @@ ODOMETRY_MIN_TRACKED = 8
 # The D435i IMU is NOT hardware-synced to the frames, so accel samples carry
 # their own timestamps and must be integrated on those, not on frame dt.
 IMU_ENABLED = True
-IMU_ACCEL_FPS = 250
+IMU_ACCEL_FPS = 200
 IMU_GYRO_FPS = 200
 # Gravity leaks into forward accel whenever the chassis pitches (ramps, speed
 # bumps). Above this the accel sample is distrusted and flow carries the estimate.
@@ -109,15 +109,15 @@ MANUAL_KEY_TIMEOUT_S = 0.5
 ROI_Y_START_RATIO = 0.67
 ROI_Y_END_RATIO = 0.86
 ROI_X_START_RATIO = 0.05
-ROI_X_END_RATIO = 0.85
+ROI_X_END_RATIO = 0.95
 LOOKAHEAD_ROI_Y_START_RATIO = 0.42
 LOOKAHEAD_ROI_Y_END_RATIO = 0.62
 LOOKAHEAD_ROI_X_START_RATIO = 0.05
-LOOKAHEAD_ROI_X_END_RATIO = 0.85
+LOOKAHEAD_ROI_X_END_RATIO = 0.95
 FAR_ROI_Y_START_RATIO = 0.24
 FAR_ROI_Y_END_RATIO = 0.40
 FAR_ROI_X_START_RATIO = 0.05
-FAR_ROI_X_END_RATIO = 0.85
+FAR_ROI_X_END_RATIO = 0.95
 WIDE_ROI_Y_START_RATIO = 0.20
 WIDE_ROI_X_START_RATIO = 0.0
 WIDE_ROI_X_END_RATIO = 1.0
@@ -154,6 +154,13 @@ RIGHT_RPWM = 18
 # None if you have strapped them to +5V in hardware instead.
 LEFT_EN = 20
 RIGHT_EN = 21
+
+# Per-side polarity. The IBT-2 boards are symmetric, so whether a side runs
+# backwards depends only on how its motor leads are landed -- that is wiring
+# data, which is why it lives beside the pin numbers instead of in the driver.
+# Re-verify with _scratch_sides.py after any rewiring.
+LEFT_MOTOR_INVERT = False
+RIGHT_MOTOR_INVERT = False
 
 # pigpio's DMA-timed PWM only offers 18 frequencies, and which ones depend on
 # pigpiod's sample rate (default 5us). 10 kHz is NOT selectable at 5us -- it
