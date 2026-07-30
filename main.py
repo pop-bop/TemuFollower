@@ -150,11 +150,16 @@ def obstacle_leg_done(estimator, mark, target_mm, started_at, now):
 
 
 def sigterm_handler(signum, frame):
-    print("Caught SIGTERM, triggering cleanup...")
+    print("Caught signal %d, triggering cleanup..." % signum)
     sys.exit(0)
 
 def main():
     signal.signal(signal.SIGTERM, sigterm_handler)
+    # SIGHUP too: it fires when an SSH session drops, which is how this robot is
+    # driven. Without it the process dies without unwinding and the PWM stays
+    # latched at whatever duty was last written, so the robot drives off.
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, sigterm_handler)
     camera_kind, camera = open_camera()
     depth_scale = get_depth_scale(camera)
     motors, close_motors = create_motors()
