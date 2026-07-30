@@ -210,12 +210,31 @@ class SpeedEstimator:
         self.vo = VisualOdometry()
         self.speed_mps = 0.0
         self.source = "init"
+        self.distance_mm = 0.0
 
     def reset(self):
         self.imu.reset()
         self.vo.reset()
         self.speed_mps = 0.0
         self.source = "reset"
+
+    def advance(self, dt):
+        """Integrate the current speed into travelled distance.
+
+        Call once per control tick. Lets manoeuvre legs be specified in
+        millimetres rather than seconds, which is what makes a dead-reckoned
+        go-around repeatable across battery states.
+        """
+        if dt > 0.0:
+            self.distance_mm += abs(self.speed_mps) * 1000.0 * dt
+        return self.distance_mm
+
+    def mark(self):
+        """Odometer snapshot to measure a leg against."""
+        return self.distance_mm
+
+    def travelled_since(self, mark):
+        return self.distance_mm - mark
 
     def add_imu_accel(self, accel_xyz, timestamp_s):
         self.speed_mps = self.imu.add_accel(accel_xyz, timestamp_s)

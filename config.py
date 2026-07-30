@@ -257,6 +257,62 @@ OBSTACLE_DETECTION_ENABLED = False
 OBSTACLE_MIN_HEIGHT_MM = 100.0
 OBSTACLE_MIN_AREA_PX = 400
 
+# --- Obstacle band detection + go-around ----------------------------------
+# Separate from the per-pixel mask above, which stays off. Because the lens sits
+# only 60mm up and every FOV ray points downward, anything taller than the mount
+# intercepts the WHOLE image column: a 15cm obstacle is a full-height vertical
+# BAND, not a blob. That is a much stronger cue than a per-pixel depth step, and
+# it needs no colour -- which matters because red marks the goal tile and the
+# dead-victim point, not obstacles.
+OBSTACLE_BAND_ENABLED = True
+
+# A downward ray reaches the floor before an obstacle whenever the floor is
+# nearer, so an obstacle does NOT fill its columns -- it is anchored at the top
+# of the frame and grows downward as range closes (~7% of frame height at 500mm,
+# ~42% at 150mm). The cue is a wide run of columns reading nearer than the
+# expected GROUND depth, using GROUND_DEPTH_TOLERANCE_MM as the margin.
+#
+# A band must be this wide (as a fraction of frame width) to count. Rejects
+# debris and single-column depth noise.
+OBSTACLE_BAND_MIN_WIDTH_RATIO = 0.12
+# Ignore anything farther than this; far bands are walls and course furniture.
+OBSTACLE_BAND_MAX_RANGE_MM = 500.0
+# Consecutive frames a band must persist before it is believed.
+OBSTACLE_BAND_MIN_FRAMES = 3
+
+# The D435 cannot measure closer than ~105-280mm depending on preset, so depth
+# goes to zero exactly at the 80mm standoff we want. The dropout IS the trigger:
+# once a tracked band's depth vanishes we are at the near limit. Distance is
+# therefore imprecise and preset-dependent -- a deliberate trade for not needing
+# to dead-reckon through the blind zone.
+OBSTACLE_TRIGGER_ON_DROPOUT = True
+# A band must have been this close before its dropout is trusted, so a band
+# lost to noise at long range does not fire the manoeuvre.
+OBSTACLE_DROPOUT_MAX_RANGE_MM = 320.0
+# Consecutive all-invalid frames required. Depth flickers; one frame is noise.
+OBSTACLE_DROPOUT_FRAMES = 2
+
+ROBOT_WIDTH_MM = 200.0
+# Obstacles occupy at most one tile (300mm). Clearing a worst-case one needs
+# obstacle half-width + robot half-width + margin. This exceeds the 150mm of
+# on-tile room either side of the line, so the robot briefly leaves the tile --
+# the rules score navigating AROUND an obstacle, not staying on-tile.
+OBSTACLE_CLEARANCE_MARGIN_MM = 40.0
+OBSTACLE_LATERAL_OFFSET_MM = 150.0 + ROBOT_WIDTH_MM / 2.0 + OBSTACLE_CLEARANCE_MARGIN_MM
+# Forward run past the obstacle before cutting back toward the line. One tile
+# plus the robot's own length worth of slack.
+OBSTACLE_PASS_FORWARD_MM = 380.0
+# Speeds for the manoeuvre. Deliberately below BASE_SPEED: the legs are
+# dead-reckoned, and odometry error grows with speed.
+OBSTACLE_MANEUVER_SPEED = 0.20
+OBSTACLE_MANEUVER_TURN = 0.55
+# Give up on a leg after this long even if the odometry target is never met,
+# so a stalled wheel or bad flow estimate cannot hang the manoeuvre forever.
+OBSTACLE_LEG_TIMEOUT_S = 6.0
+# After the pass, sweep this far looking for the line before declaring failure
+# and retrying on the other side.
+OBSTACLE_REACQUIRE_MM = 260.0
+
 # SPI Configuration
 SPI_BUS = 0
 SPI_DEVICE = 0

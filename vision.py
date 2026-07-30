@@ -10,7 +10,9 @@ from config import (
     WIDE_ROI_Y_START_RATIO, WIDE_ROI_X_START_RATIO, WIDE_ROI_X_END_RATIO,
     BLACK_THRESHOLD, MIN_LINE_AREA, GREEN_DIFF_THRESHOLD, RED_DIFF_THRESHOLD,
     MIN_MARKER_AREA, INTERSECTION_MIN_AREA, INTERSECTION_MIN_CONTOURS,
-    WARP_MATRIX, GROUND_DEPTH_TOLERANCE_MM, OBSTACLE_DETECTION_ENABLED
+    WARP_MATRIX, GROUND_DEPTH_TOLERANCE_MM, OBSTACLE_DETECTION_ENABLED,
+    OBSTACLE_BAND_ENABLED,
+    OBSTACLE_BAND_MIN_WIDTH_RATIO, OBSTACLE_BAND_MAX_RANGE_MM,
 )
 from utils import clamp
 
@@ -41,6 +43,101 @@ def get_obstacle_mask(depth_frame, depth_scale, expected_map):
     obs = (expected_map - depth_mm) > GROUND_DEPTH_TOLERANCE_MM
     obs = obs & (depth_mm > 0)
     return obs.astype(np.uint8) * 255
+
+
+def detect_obstacle_band(depth_frame, depth_scale, expected_map=None):
+    """Find an upright obstacle as a wide column run reading nearer than floor.
+
+    Geometry note, because it is counter-intuitive: a downward ray reaches the
+    floor before an obstacle whenever the floor is nearer, so an obstacle does
+    NOT fill its columns. It is anchored at the TOP of the frame and grows
+    downward as range closes -- about 7% of frame height at 500mm, 42% at 150mm.
+    The cue is therefore "measured depth well nearer than the expected GROUND
+    depth for that row", counted per column. No colour is used: red marks the
+    goal tile and the dead-victim point, not obstacles.
+
+    Returns a dict with:
+      found            band believed present this frame
+      range_mm         nearest depth within the band
+      center_offset    band centre as -1..+1 across the frame
+      width_ratio      band width as a fraction of frame width
+      fill_ratio       how much of the band's height reads as obstacle; grows
+                       as the robot closes in
+      left_clearance_mm / right_clearance_mm
+                       median depth either side of the band, for choosing a
+                       side to pass on
+      any_valid_depth  whether the frame carried usable depth at all, so the
+                       caller can tell "no obstacle" from "sensor blind"
+    """
+    result = {
+        "found": False, "range_mm": None, "center_offset": 0.0,
+        "width_ratio": 0.0, "fill_ratio": 0.0, "left_clearance_mm": None,
+        "right_clearance_mm": None, "any_valid_depth": False,
+    }
+    if not OBSTACLE_BAND_ENABLED or depth_frame is None or expected_map is None:
+        return result
+
+    depth_mm = depth_frame.astype(np.float32) * (depth_scale * 1000.0)
+    h, w = depth_mm.shape[:2]
+    valid = depth_mm > 0
+    result["any_valid_depth"] = bool(valid.any())
+    if not result["any_valid_depth"]:
+        return result
+
+    # Nearer than the floor would be by a clear margin, and near enough to be
+    # an obstacle on our tile rather than a wall across the room.
+    nearer = valid & ((expected_map - depth_mm) > GROUND_DEPTH_TOLERANCE_MM)
+    nearer &= depth_mm <= OBSTACLE_BAND_MAX_RANGE_MM
+
+    col_frac = nearer.mean(axis=0)
+    # An obstacle at the far end of the usable range still only fills a few
+    # percent of its column, so this floor has to stay low.
+    is_obstacle_col = col_frac >= 0.04
+    if not is_obstacle_col.any():
+        return result
+
+    best_start = best_len = run_start = run_len = 0
+    for x in range(w):
+        if is_obstacle_col[x]:
+            if run_len == 0:
+                run_start = x
+            run_len += 1
+            if run_len > best_len:
+                best_len, best_start = run_len, run_start
+        else:
+            run_len = 0
+
+    if best_len < max(1, int(w * OBSTACLE_BAND_MIN_WIDTH_RATIO)):
+        return result
+
+    x0, x1 = best_start, best_start + best_len
+    band_hits = depth_mm[:, x0:x1][nearer[:, x0:x1]]
+    if band_hits.size == 0:
+        return result
+
+    result["found"] = True
+    result["range_mm"] = float(np.percentile(band_hits, 10))
+    result["width_ratio"] = best_len / float(w)
+    result["fill_ratio"] = float(nearer[:, x0:x1].mean())
+    center_px = (x0 + x1) / 2.0
+    result["center_offset"] = float((center_px - w / 2.0) / (w / 2.0))
+
+    # Free space either side, used to pick a passing side. Median depth is
+    # useless here -- open floor reads the same on both sides -- so measure the
+    # nearest OBSTRUCTION instead: the closest thing on that side reading nearer
+    # than the floor should be. No obstruction leaves the side wide open.
+    for key, sl in (("left_clearance_mm", np.s_[:, :x0]),
+                    ("right_clearance_mm", np.s_[:, x1:])):
+        region = depth_mm[sl]
+        blocked = nearer[sl]
+        if region.size == 0:
+            result[key] = 0.0
+        elif blocked.any():
+            result[key] = float(np.percentile(region[blocked], 10))
+        else:
+            result[key] = float(OBSTACLE_BAND_MAX_RANGE_MM)
+
+    return result
 
 
 def find_line_error(frame, obstacle_mask, y_start_ratio, y_end_ratio, x_start_ratio, x_end_ratio):

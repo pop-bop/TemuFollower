@@ -23,6 +23,10 @@ from config import (
     VISION_DELAY_S, TURN_SLEW_RATE_PER_S,
     VISION_DELAY_MIN_S, VISION_DELAY_MAX_S, VISION_DELAY_FROM_ODOMETRY,
     ODOMETRY_ENABLED, BEV_ENABLED, BEV_NEAR_MM, BEV_CAMERA_AXLE_OFFSET_MM,
+    OBSTACLE_BAND_ENABLED, OBSTACLE_BAND_MIN_FRAMES, OBSTACLE_DROPOUT_FRAMES,
+    OBSTACLE_DROPOUT_MAX_RANGE_MM, OBSTACLE_TRIGGER_ON_DROPOUT,
+    OBSTACLE_LATERAL_OFFSET_MM, OBSTACLE_PASS_FORWARD_MM, OBSTACLE_REACQUIRE_MM,
+    OBSTACLE_MANEUVER_SPEED, OBSTACLE_MANEUVER_TURN, OBSTACLE_LEG_TIMEOUT_S,
 )
 from camera import (
     open_camera, read_frame, read_frame_with_motion, has_imu, get_intrinsics,
@@ -30,6 +34,7 @@ from camera import (
 from vision import (
     find_line_error_normal, find_line_error_lookahead, find_line_error_far,
     find_line_error_wide, print_calibration_info, detect_intersection_normal,
+    detect_obstacle_band,
 )
 from uart_master import UARTMaster
 from motors import RobotMotors
@@ -69,6 +74,81 @@ def odometry_vision_delay(speed_mps):
     )
 
 
+class ObstacleTracker:
+    """Debounces band detections and decides when the robot is at standoff.
+
+    The D435 cannot measure closer than ~105-280mm depending on preset, so depth
+    inside the band drops to zero right around the standoff we want. That
+    dropout IS the trigger: once a band we were already tracking at close range
+    loses all valid depth, we are at the sensor's near limit. The exact standoff
+    is therefore preset-dependent rather than a precise 80mm -- the trade for not
+    having to dead-reckon blindly through the last few centimetres.
+
+    The range guard matters: without it, a band lost to ordinary depth noise at
+    400mm would fire the manoeuvre in open space.
+    """
+
+    def __init__(self):
+        self.present_frames = 0
+        self.dropout_frames = 0
+        self.last_range_mm = None
+        self.center_offset = 0.0
+        self.prefer_left = None
+
+    def reset(self):
+        self.present_frames = 0
+        self.dropout_frames = 0
+        self.last_range_mm = None
+        self.prefer_left = None
+
+    def update(self, band):
+        """Feed one detection. Returns True when the standoff is reached."""
+        if band["found"]:
+            self.present_frames += 1
+            self.dropout_frames = 0
+            self.last_range_mm = band["range_mm"]
+            self.center_offset = band["center_offset"]
+            # Pass toward whichever side has the more distant nearest
+            # obstruction. Latched on first confident sight, because once the
+            # obstacle fills the frame these clearances stop being meaningful.
+            if self.prefer_left is None and self.present_frames >= OBSTACLE_BAND_MIN_FRAMES:
+                left = band["left_clearance_mm"]
+                right = band["right_clearance_mm"]
+                if left is not None and right is not None and left != right:
+                    self.prefer_left = left > right
+                else:
+                    # Nothing to choose between: go against the obstacle's own
+                    # offset, which is the shorter way around.
+                    self.prefer_left = band["center_offset"] > 0
+            return False
+
+        tracked = self.present_frames >= OBSTACLE_BAND_MIN_FRAMES
+        close = (self.last_range_mm is not None
+                 and self.last_range_mm <= OBSTACLE_DROPOUT_MAX_RANGE_MM)
+        if not (tracked and close and OBSTACLE_TRIGGER_ON_DROPOUT):
+            # Never got close enough to be believable -- decay the track.
+            if not band["any_valid_depth"]:
+                return False
+            self.present_frames = max(0, self.present_frames - 1)
+            if self.present_frames == 0:
+                self.reset()
+            return False
+
+        self.dropout_frames += 1
+        return self.dropout_frames >= OBSTACLE_DROPOUT_FRAMES
+
+
+def obstacle_leg_done(estimator, mark, target_mm, started_at, now):
+    """True once a manoeuvre leg has run its distance, or timed out.
+
+    The timeout is the safety net: if flow dies on a featureless floor the
+    odometer stops advancing and the leg would otherwise never finish.
+    """
+    if estimator is not None and estimator.travelled_since(mark) >= target_mm:
+        return True
+    return (now - started_at) >= OBSTACLE_LEG_TIMEOUT_S
+
+
 def main():
     camera_kind, camera = open_camera()
     depth_scale = get_depth_scale(camera)
@@ -101,6 +181,13 @@ def main():
         print("Odometry: BEV unavailable, falling back to fixed vision delay.")
     vision_delay = VISION_DELAY_S
     last_bev_time = None
+
+    obstacle_tracker = ObstacleTracker()
+    obstacle_leg = None
+    obstacle_leg_mark = 0.0
+    obstacle_leg_start = 0.0
+    obstacle_pass_left = True
+    obstacle_retried = False
 
     integral = 0.0
     last_error = 0.0
@@ -255,12 +342,27 @@ def main():
                     derived = odometry_vision_delay(speed_estimator.speed_mps)
                     vision_delay = VISION_DELAY_S if derived is None else derived
 
+                # Advance the odometer so manoeuvre legs can be measured in mm.
+                speed_estimator.advance(dt)
+
             frame = warp_frame(color_frame, warp_M)
             obstacle_mask = None
             if OBSTACLE_DETECTION_ENABLED and expected_depth_map is not None and depth_frame is not None:
                 obstacle_mask = get_obstacle_mask(
                     warp_frame(depth_frame, warp_M), depth_scale, expected_depth_map,
                 )
+
+            # Obstacle band is measured on the RAW depth frame, not the warped
+            # one: expected_depth_map is derived from unwarped camera geometry.
+            obstacle_at_standoff = False
+            obstacle_band = None
+            if (OBSTACLE_BAND_ENABLED and depth_frame is not None
+                    and expected_depth_map is not None
+                    and not state.startswith("OBSTACLE")):
+                obstacle_band = detect_obstacle_band(
+                    depth_frame, depth_scale, expected_depth_map,
+                )
+                obstacle_at_standoff = obstacle_tracker.update(obstacle_band)
 
             if halted:
                 motors.stop()
@@ -335,6 +437,7 @@ def main():
 
             # INTERSECTION DETECTION (only when centered on the line)
             if (state not in ("BACKTRACK", "ROTATE")
+                    and not state.startswith("OBSTACLE")
                     and normal_error is not None
                     and abs(normal_error) < CENTER_DEADZONE * 2):
                 if now - last_intersection_time > INTERSECTION_COOLDOWN_S:
@@ -350,8 +453,136 @@ def main():
                         print(f"INTERSECTION: {intersection['branch_count']} branches, "
                               f"chosen idx {inter_wp['chosen_branch_idx']}")
 
+            # ----- OBSTACLE GO-AROUND -----
+            # Entered when a tracked band's depth drops out, i.e. we are at the
+            # sensor's near limit. Legs are dead-reckoned on fused odometry
+            # because the obstacle is inside the depth blind zone throughout:
+            # there is nothing left to measure against once we are this close.
+            if obstacle_at_standoff and not state.startswith("OBSTACLE"):
+                obstacle_pass_left = (obstacle_tracker.prefer_left
+                                      if obstacle_tracker.prefer_left is not None else True)
+                obstacle_retried = False
+                obstacle_leg = "CLEAR"
+                obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
+                obstacle_leg_start = now
+                state = "OBSTACLE_CLEAR"
+                motors.stop()
+                print(f"OBSTACLE at ~{obstacle_tracker.last_range_mm:.0f}mm "
+                      f"(depth dropout) -- passing "
+                      f"{'LEFT' if obstacle_pass_left else 'RIGHT'}")
+                continue
+
+            if state.startswith("OBSTACLE"):
+                # Steering sign: positive turn goes one way, negated under
+                # STEER_INVERT exactly as everywhere else in this loop.
+                away = -1.0 if obstacle_pass_left else 1.0
+                leg_turn = OBSTACLE_MANEUVER_TURN * away
+                if STEER_INVERT:
+                    leg_turn = -leg_turn
+
+                if obstacle_leg == "CLEAR":
+                    # Arc away from the line until clear of the obstacle's width.
+                    target_forward = OBSTACLE_MANEUVER_SPEED
+                    target_turn = leg_turn
+                    display_turn = leg_turn
+                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
+                                         OBSTACLE_LATERAL_OFFSET_MM,
+                                         obstacle_leg_start, now):
+                        obstacle_leg = "PASS"
+                        obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
+                        obstacle_leg_start = now
+                        state = "OBSTACLE_PASS"
+
+                elif obstacle_leg == "PASS":
+                    # Run straight past the obstacle.
+                    target_forward = OBSTACLE_MANEUVER_SPEED
+                    target_turn = 0.0
+                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
+                                         OBSTACLE_PASS_FORWARD_MM,
+                                         obstacle_leg_start, now):
+                        obstacle_leg = "RETURN"
+                        obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
+                        obstacle_leg_start = now
+                        state = "OBSTACLE_RETURN"
+
+                elif obstacle_leg == "RETURN":
+                    # Cut back toward the line, watching for it the whole way so
+                    # a short obstacle does not overshoot the return.
+                    target_forward = OBSTACLE_MANEUVER_SPEED
+                    target_turn = -leg_turn
+                    display_turn = -leg_turn
+                    if normal_error is not None:
+                        print("OBSTACLE: line reacquired")
+                        obstacle_tracker.reset()
+                        obstacle_leg = None
+                        state = "FOLLOW"
+                        vision_delay_queue.clear()
+                        reset_trajectory_state(trajectory_state)
+                        reset_trajectory_state(curvature_state)
+                        integral = 0.0
+                        continue
+                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
+                                         OBSTACLE_LATERAL_OFFSET_MM,
+                                         obstacle_leg_start, now):
+                        obstacle_leg = "REACQUIRE"
+                        obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
+                        obstacle_leg_start = now
+                        state = "OBSTACLE_REACQUIRE"
+
+                elif obstacle_leg == "REACQUIRE":
+                    # Creep forward hunting for the line. The wide ROI is used
+                    # because the line may still be off to one side.
+                    wide_err, wide_debug = find_line_error_wide(frame, obstacle_mask)
+                    active_debug = wide_debug
+                    if normal_error is not None or wide_err is not None:
+                        print("OBSTACLE: line reacquired (wide)")
+                        obstacle_tracker.reset()
+                        obstacle_leg = None
+                        state = "FOLLOW"
+                        vision_delay_queue.clear()
+                        reset_trajectory_state(trajectory_state)
+                        reset_trajectory_state(curvature_state)
+                        integral = 0.0
+                        continue
+
+                    target_forward = OBSTACLE_MANEUVER_SPEED * 0.8
+                    target_turn = 0.0
+                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
+                                         OBSTACLE_REACQUIRE_MM,
+                                         obstacle_leg_start, now):
+                        if not obstacle_retried:
+                            # Wrong side, or the obstacle was wider than assumed.
+                            # Reverse out and try the other way around.
+                            obstacle_retried = True
+                            obstacle_pass_left = not obstacle_pass_left
+                            obstacle_leg = "BACKOUT"
+                            obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
+                            obstacle_leg_start = now
+                            state = "OBSTACLE_BACKOUT"
+                            print("OBSTACLE: no line -- backing out to retry "
+                                  f"{'LEFT' if obstacle_pass_left else 'RIGHT'}")
+                        else:
+                            print("OBSTACLE: both sides failed -- falling back to search")
+                            obstacle_tracker.reset()
+                            obstacle_leg = None
+                            state = "SPIN_SEARCH"
+                            spin_start_time = now
+
+                elif obstacle_leg == "BACKOUT":
+                    # Retrace far enough to be beside the obstacle again before
+                    # arcing the other way.
+                    target_forward = -OBSTACLE_MANEUVER_SPEED
+                    target_turn = 0.0
+                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
+                                         OBSTACLE_PASS_FORWARD_MM + OBSTACLE_REACQUIRE_MM,
+                                         obstacle_leg_start, now):
+                        obstacle_leg = "CLEAR"
+                        obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
+                        obstacle_leg_start = now
+                        state = "OBSTACLE_CLEAR"
+
             # ----- BACKTRACK: reverse along the line to reach last intersection -----
-            if state == "BACKTRACK":
+            elif state == "BACKTRACK":
                 backtrack_err, backtrack_debug = find_line_error_normal(frame, obstacle_mask)
                 active_debug = backtrack_debug
 
