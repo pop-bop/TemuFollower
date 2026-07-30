@@ -2,4 +2,4 @@ opencv-python
 numpy
 pyrealsense2
 RPi.GPIO
-pyserial
+pigpio

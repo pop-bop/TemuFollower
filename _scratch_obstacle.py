@@ -7,18 +7,29 @@ what triggers the manoeuvre.
 import sys, types, threading, time, math
 import numpy as np
 
-ser = types.ModuleType("serial")
-ser.SerialException = type("SerialException", (Exception,), {})
-class _S:
-    def __init__(self, *a, **k): raise ser.SerialException("no serial on dev box")
-ser.Serial = _S
-sys.modules["serial"] = ser
-
 import config
 config.SHOW_DEBUG_VIEW = False
 config.LOOP_LOG_INTERVAL_S = 0.25
 
 import camera, main as m
+
+# There is no pigpio or motor hardware on the dev box, and create_motors() now
+# raises rather than silently degrading, so hand main() a recording stub.
+class FakeMotors:
+    def __init__(self):
+        self.commands = []
+
+    def set_speeds(self, left, right):
+        self.commands.append((left, right))
+
+    def stop(self):
+        self.commands.append(("stop",))
+
+    def close(self):
+        pass
+
+fake_motors = FakeMotors()
+m.create_motors = lambda: (fake_motors, fake_motors.close)
 
 H, W = 480, 640
 MOUNT, TILT, VFOV = 60.0, 25.0, 42.0

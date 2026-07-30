@@ -36,8 +36,6 @@ from vision import (
     find_line_error_wide, print_calibration_info, detect_intersection_normal,
     detect_obstacle_band,
 )
-from uart_master import UARTMaster
-from motors import RobotMotors
 from pi_motors import create_motors
 from vision import get_warp_matrix, warp_frame, get_expected_depth_map, get_obstacle_mask
 from camera import get_depth_scale
@@ -338,9 +336,17 @@ def main():
                     # back to the commanded duty rather than trusting a stale value.
                     speed_estimator.fallback_from_command(applied_forward)
 
-                if VISION_DELAY_FROM_ODOMETRY and odometry_ready:
+                # Only derive the delay from a genuinely MEASURED speed. The
+                # command fallback above is just the commanded duty played back,
+                # so feeding it here closed a loop (duty -> "speed" -> phase lag
+                # -> duty) and swung the delay 120-300ms frame to frame, which is
+                # the oscillation VISION_DELAY_* was introduced to kill.
+                if (VISION_DELAY_FROM_ODOMETRY and odometry_ready
+                        and speed_estimator.source == "fused"):
                     derived = odometry_vision_delay(speed_estimator.speed_mps)
                     vision_delay = VISION_DELAY_S if derived is None else derived
+                else:
+                    vision_delay = VISION_DELAY_S
 
                 # Advance the odometer so manoeuvre legs can be measured in mm.
                 speed_estimator.advance(dt)
@@ -794,6 +800,12 @@ def main():
                     target_forward = BASE_SPEED * (1.0 - blend)
                     target_turn = motor_turn * (1.0 - blend) + (SHARP_TURN_SPEED * turn_sign) * blend
 
+                # The blend above deliberately drives forward speed to zero on the
+                # sharpest turns so the robot can pivot. Remember whether it ever
+                # intended to translate, because the clamp below must not
+                # resurrect a speed the geometry just cancelled.
+                wants_to_translate = target_forward >= MIN_SPEED
+
                 derivative_load = clamp(
                     abs(derivative) / max(0.001, ADAPTIVE_DERIVATIVE_REF),
                     0.0, 1.0,
@@ -809,7 +821,13 @@ def main():
                     )
                     target_forward *= clamp(confidence_scale, LOW_CONFIDENCE_SPEED_SCALE, 1.0)
 
-                target_forward = clamp(target_forward, MIN_SPEED, MAX_SPEED)
+                # Floor at MIN_SPEED only if we meant to move forward at all.
+                # Flooring unconditionally undid every taper above and pinned
+                # forward at exactly MIN_SPEED through hard turns, forcing the
+                # robot to creep through corners it should have pivoted around.
+                target_forward = clamp(
+                    target_forward, MIN_SPEED if wants_to_translate else 0.0, MAX_SPEED,
+                )
 
                 search_direction = 1.0 if error >= 0 else -1.0
                 if STEER_INVERT:
@@ -857,7 +875,11 @@ def main():
 
                     if now - spin_start_time < LINE_LOST_STOP_TIMEOUT_S:
                         target_forward = 0.0
-                        target_turn = -SPIN_SEARCH_SPEED * search_direction
+                        # search_direction already has STEER_INVERT folded in
+                        # (see where it is assigned), so it is used unnegated --
+                        # matching the BACKTRACK search. Negating it here spun the
+                        # robot away from where the line was last seen.
+                        target_turn = SPIN_SEARCH_SPEED * search_direction
                     else:
                         # Dead end: try backtracking if we have intersection history
                         if not dead_end_recorded:

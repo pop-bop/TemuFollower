@@ -137,10 +137,6 @@ CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
 USB_CAMERA_INDEX = 0
 
-# "pi" drives the bridges from Pi GPIO via pigpio; "uart" keeps the old ESP32
-# hop; "auto" prefers pi and falls back to uart if pigpio/pigpiod is missing.
-MOTOR_BACKEND = "auto"
-
 # Motor pins (BCM numbering) -- RPi drives the two IBT-2/BTS7960 boards directly.
 # Each board takes an LPWM/RPWM pair rather than the L298N ENA+IN1+IN2 triple:
 # to drive a side you PWM one input and hold the other at 0.
@@ -149,10 +145,6 @@ MOTOR_BACKEND = "auto"
 # read LOW through boot before any code runs. Pins 0-8 default HIGH and must
 # never be used here. SPI0 (7-11), I2C1 (2,3) and the UART console (14,15) are
 # left free.
-#
-# 12/18 share hardware PWM0 and 13/19 share PWM1, so the four cannot all be
-# independent hardware channels at once. That is fine: only one input per side
-# is ever non-zero, so at most two are live simultaneously.
 LEFT_LPWM = 13
 LEFT_RPWM = 12
 RIGHT_LPWM = 19
@@ -163,11 +155,16 @@ RIGHT_RPWM = 18
 LEFT_EN = 20
 RIGHT_EN = 21
 
-# 20 kHz would be inaudible, but pigpio's DMA-timed PWM only resolves
-# 1e6/(sample_us * freq) duty steps -- 50 at 20 kHz, too coarse to steer with.
-# 10 kHz gives 100 steps. Pins that get a real hardware channel are driven via
-# hardware_PWM() and are not subject to this limit.
-PWM_FREQUENCY_HZ = 10000
+# pigpio's DMA-timed PWM only offers 18 frequencies, and which ones depend on
+# pigpiod's sample rate (default 5us). 10 kHz is NOT selectable at 5us -- it
+# clamps to 8000, whose real range is 1e6/(5*8000) = 25 duty steps, i.e. 4% per
+# step. That is coarser than MOTOR_MIN_DUTY, so the minimum-duty threshold
+# landed between steps. 2 kHz gives 100 steps (1%) and is still inaudible-ish.
+#
+# Hardware PWM is deliberately NOT used: only GPIO 12/13/18/19 have it, they map
+# to just two channels (12/18 -> 0, 13/19 -> 1), and a channel's duty is shared
+# by every GPIO on it -- so driving all four collapsed the two sides into one.
+PWM_FREQUENCY_HZ = 2000
 
 # Cut the motors if the control loop stops feeding commands. With no
 # microcontroller latching state, a crashed process would otherwise leave the
@@ -312,8 +309,3 @@ OBSTACLE_LEG_TIMEOUT_S = 6.0
 # After the pass, sweep this far looking for the line before declaring failure
 # and retrying on the other side.
 OBSTACLE_REACQUIRE_MM = 260.0
-
-# SPI Configuration
-SPI_BUS = 0
-SPI_DEVICE = 0
-SPI_MAX_SPEED_HZ = 1000000

@@ -23,31 +23,31 @@ except ImportError:
 
 _PWM_RANGE = 255
 
-# 12/18 share hardware PWM0 and 13/19 share PWM1. Only one input per side is
-# ever non-zero, so at most two are live at once and the sharing never bites.
-_HARDWARE_PWM_PINS = frozenset((12, 13, 18, 19))
-
 
 class PiMotorDriver:
     """Low-level pin driver. Owns the pigpio handle and the failsafe watchdog."""
 
     def __init__(self):
         if pigpio is None:
+            # python3-pigpio installs to system dist-packages, which a venv
+            # cannot see -- inside one you need the pip client as well.
             raise RuntimeError(
-                "pigpio module not installed. Install with: sudo apt install python3-pigpio"
+                "pigpio module not importable. System-wide: sudo apt install python3-pigpio. "
+                "In a venv: pip install pigpio"
             )
+
         self.pi = pigpio.pi()
         if not self.pi.connected:
-            raise RuntimeError(
-                "Cannot reach pigpiod. Start it with: sudo systemctl start pigpiod"
-            )
+            raise RuntimeError("Cannot reach pigpiod. Start it with: sudo systemctl start pigpiod")
 
         self._pins = (LEFT_LPWM, LEFT_RPWM, RIGHT_LPWM, RIGHT_RPWM)
         for pin in self._pins:
             self.pi.set_mode(pin, pigpio.OUTPUT)
-            if pin not in _HARDWARE_PWM_PINS:
-                self.pi.set_PWM_frequency(pin, PWM_FREQUENCY_HZ)
-                self.pi.set_PWM_range(pin, _PWM_RANGE)
+            actual = self.pi.set_PWM_frequency(pin, PWM_FREQUENCY_HZ)
+            if actual != PWM_FREQUENCY_HZ:
+                print(f"[WARN] GPIO {pin}: asked {PWM_FREQUENCY_HZ}Hz, got {actual}Hz. "
+                      f"Duty resolution is {self.pi.get_PWM_real_range(pin)} steps.")
+            self.pi.set_PWM_range(pin, _PWM_RANGE)
             self._write(pin, 0)
 
         for pin in (LEFT_EN, RIGHT_EN):
@@ -63,13 +63,17 @@ class PiMotorDriver:
         self._watchdog.start()
 
     def _write(self, pin, duty):
-        """duty is 0..255."""
-        if pin in _HARDWARE_PWM_PINS:
-            # hardware_PWM takes duty in millionths and is not subject to
-            # pigpio's sample-rate duty quantisation.
-            self.pi.hardware_PWM(pin, PWM_FREQUENCY_HZ, int(duty * 1000000 / _PWM_RANGE))
-        else:
-            self.pi.set_PWM_dutycycle(pin, duty)
+        """duty is 0.._PWM_RANGE.
+
+        Software (DMA-timed) PWM, not hardware_PWM: the Pi has only two hardware
+        channels and both motor pin pairs land on them (12/18 -> ch0, 13/19 ->
+        ch1). Since a channel's duty is shared by every GPIO on it, the last
+        write won and the left side's command was silently discarded. Software
+        PWM is independent per GPIO.
+        """
+        result = self.pi.set_PWM_dutycycle(pin, duty)
+        if result < 0:
+            raise RuntimeError(f"pigpio rejected duty {duty} on GPIO {pin}: {result}")
 
     def _apply_side(self, lpwm_pin, rpwm_pin, duty, reverse):
         if reverse:
@@ -104,16 +108,23 @@ class PiMotorDriver:
     def _watch(self):
         while True:
             time.sleep(MOTOR_COMMAND_TIMEOUT_S / 3.0)
-            with self._lock:
-                if self._closed:
-                    return
-                if self._tripped:
-                    continue
-                if time.monotonic() - self._last_command <= MOTOR_COMMAND_TIMEOUT_S:
-                    continue
-                for pin in self._pins:
-                    self._write(pin, 0)
-                self._tripped = True
+            try:
+                with self._lock:
+                    if self._closed:
+                        return
+                    if self._tripped:
+                        continue
+                    if time.monotonic() - self._last_command <= MOTOR_COMMAND_TIMEOUT_S:
+                        continue
+                    for pin in self._pins:
+                        self._write(pin, 0)
+                    self._tripped = True
+            except Exception as e:
+                # Never let a write error kill this thread -- it is the only
+                # thing that cuts the motors if the control loop stops feeding
+                # commands, and a dead watchdog fails silently and dangerously.
+                print(f"[SAFE] watchdog write failed: {e}")
+                continue
             print("[SAFE] motor command timeout - outputs cut")
 
     @property
@@ -124,17 +135,21 @@ class PiMotorDriver:
         with self._lock:
             if self._closed:
                 return
-            for pin in self._pins:
-                self._write(pin, 0)
-            for pin in (LEFT_EN, RIGHT_EN):
-                if pin is not None:
-                    self.pi.write(pin, 0)
             self._closed = True
-        self.pi.stop()
+            try:
+                for pin in self._pins:
+                    self._write(pin, 0)
+                for pin in (LEFT_EN, RIGHT_EN):
+                    if pin is not None:
+                        self.pi.write(pin, 0)
+            finally:
+                # Dropping the daemon connection releases the pins regardless, so
+                # this must run even if zeroing a duty failed.
+                self.pi.stop()
 
 
 class PiRobotMotors:
-    """Drop-in replacement for RobotMotors, driving the bridges from Pi GPIO."""
+    """Maps signed left/right commands onto the two bridges."""
 
     def __init__(self, driver=None):
         self.driver = driver if driver is not None else PiMotorDriver()
@@ -219,26 +234,13 @@ class PiRobotMotors:
 
 
 def create_motors():
-    """Build the motor backend named by MOTOR_BACKEND.
+    """Build the motor backend.
 
-    Returns (motors, closer). closer() releases whatever the backend owns, so
-    main() does not have to know which one it got.
+    Returns (motors, closer). Raises rather than degrading: an earlier version
+    fell back to the ESP32 UART backend, whose transport went silent when the
+    port was absent, so the robot ran a full course with dead motors while the
+    control loop logged healthy commands.
     """
-    from config import MOTOR_BACKEND
-
-    if MOTOR_BACKEND in ("pi", "auto"):
-        try:
-            motors = PiRobotMotors()
-            print("Motors: Pi GPIO backend (pigpio)")
-            return motors, motors.close
-        except RuntimeError as e:
-            if MOTOR_BACKEND == "pi":
-                raise
-            print(f"Motors: pigpio unavailable ({e}); falling back to UART.")
-
-    from motors import RobotMotors
-    from uart_master import UARTMaster
-
-    uart = UARTMaster()
-    print("Motors: ESP32 UART backend")
-    return RobotMotors(uart), uart.close
+    motors = PiRobotMotors()
+    print("Motors: Pi GPIO backend (pigpio)")
+    return motors, motors.close
