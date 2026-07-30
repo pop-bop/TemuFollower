@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import time
+import signal
+import sys
 from collections import deque
 
 import cv2
@@ -147,7 +149,12 @@ def obstacle_leg_done(estimator, mark, target_mm, started_at, now):
     return (now - started_at) >= OBSTACLE_LEG_TIMEOUT_S
 
 
+def sigterm_handler(signum, frame):
+    print("Caught SIGTERM, triggering cleanup...")
+    sys.exit(0)
+
 def main():
+    signal.signal(signal.SIGTERM, sigterm_handler)
     camera_kind, camera = open_camera()
     depth_scale = get_depth_scale(camera)
     motors, close_motors = create_motors()
@@ -389,10 +396,10 @@ def main():
                         target_forward = -MANUAL_SPEED
                         state = "MANUAL BACKWARD"
                     elif last_manual_command == ord("a"):
-                        target_turn = -MANUAL_SPEED if STEER_INVERT else MANUAL_SPEED
+                        target_turn = MANUAL_SPEED if STEER_INVERT else -MANUAL_SPEED
                         state = "MANUAL LEFT"
                     elif last_manual_command == ord("d"):
-                        target_turn = MANUAL_SPEED if STEER_INVERT else -MANUAL_SPEED
+                        target_turn = -MANUAL_SPEED if STEER_INVERT else MANUAL_SPEED
                         state = "MANUAL RIGHT"
                     else:
                         state = "MANUAL IDLE"

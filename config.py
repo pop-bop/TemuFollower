@@ -83,7 +83,11 @@ IMU_MAX_PITCH_DEV_DEG = 12.0
 # SPEEDS
 SHARP_TURN_SPEED = 0.50
 MAX_TURN_SPEED = 0.65
-STEER_INVERT = True
+# Negate the turn term on its way to the motors. With the right side no longer
+# mirrored in pi_motors, left = f + t already yaws toward a positive error, so
+# no extra flip is wanted. This was only ever True to compensate for that
+# mirror, which also meant yaw did not depend on the turn term at all.
+STEER_INVERT = False
 BASE_SPEED = 0.26
 MAX_SPEED = 0.42
 MIN_SPEED = 0.1
