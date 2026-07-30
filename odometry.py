@@ -31,6 +31,15 @@ from utils import clamp
 
 _GRAVITY = 9.80665
 
+# Rest detection: commanded duty below this counts as parked, and the gyro must
+# also be quiet so a hand-pushed or coasting robot is not mistaken for still.
+_STILL_CMD_EPS = 0.02
+_STILL_GYRO_DPS = 2.0
+# Per-sample blend into the learned gravity reference. At ~250Hz this averages
+# over a couple of seconds, slow enough to ignore noise, fast enough to track
+# the chassis settling.
+_REST_REF_ALPHA = 0.002
+
 _LK_PARAMS = dict(
     winSize=(21, 21),
     maxLevel=3,
@@ -145,10 +154,26 @@ class ImuIntegrator:
         self.last_ts = None
         self.pitch_dev_deg = 0.0
         self.yaw_rate_dps = 0.0
+        # Resting gravity vector (ay, az), learned while stationary. The mounted
+        # angle measures 25.0 in CAD but 24.2-27.9 across bench runs, and a 1
+        # degree error puts a ~0.17 m/s^2 constant residual on the forward axis,
+        # which integrates into metres of phantom travel. So the reference is
+        # measured rather than derived from CAMERA_TILT_ANGLE_DEG, which stays
+        # the CAD value because BEV geometry is calibrated against it.
+        self._rest_ref = None
+        self._at_rest = False
 
     def reset(self, velocity_mps=0.0):
         self.velocity_mps = velocity_mps
         self.last_ts = None
+
+    def note_command(self, forward, turn):
+        """Tell the integrator what the robot was last told to do.
+
+        Commanded-still is the half of the rest test that the accelerometer
+        cannot supply: at a steady cruise it reads exactly what it reads parked.
+        """
+        self._at_rest = abs(forward) < _STILL_CMD_EPS and abs(turn) < _STILL_CMD_EPS
 
     def add_gyro(self, gyro_xyz):
         # D435i gyro: y is yaw about the vertical axis.
@@ -168,16 +193,39 @@ class ImuIntegrator:
 
         ax, ay, az = accel_xyz
 
-        tilt = math.radians(CAMERA_TILT_ANGLE_DEG)
-        # An accelerometer reports specific force, not the gravity field, so at
-        # rest it reads the UP vector: a level D435i gives (0, -g, 0) with +Y
-        # down. Both components are negative once the lens is pitched down.
-        expected_y = -_GRAVITY * math.cos(tilt)
-        expected_z = -_GRAVITY * math.sin(tilt)
+        stationary = self._at_rest and abs(self.yaw_rate_dps) < _STILL_GYRO_DPS
+        if stationary:
+            # Whatever the accelerometer reads while parked IS gravity, by
+            # definition. Learning it here absorbs mount angle, sensor bias and
+            # any settling of the chassis in one term.
+            if self._rest_ref is None:
+                self._rest_ref = (ay, az)
+            else:
+                ry, rz = self._rest_ref
+                self._rest_ref = (
+                    ry + _REST_REF_ALPHA * (ay - ry),
+                    rz + _REST_REF_ALPHA * (az - rz),
+                )
 
-        # Ground-forward direction expressed in the tilted camera frame.
-        fwd_y = -math.sin(tilt)
-        fwd_z = math.cos(tilt)
+        if self._rest_ref is not None:
+            expected_y, expected_z = self._rest_ref
+        else:
+            tilt = math.radians(CAMERA_TILT_ANGLE_DEG)
+            # An accelerometer reports specific force, not the gravity field, so
+            # at rest it reads the UP vector: a level D435i gives (0, -g, 0) with
+            # +Y down. Both components are negative once the lens is pitched down.
+            expected_y = -_GRAVITY * math.cos(tilt)
+            expected_z = -_GRAVITY * math.sin(tilt)
+
+        # Ground-forward is perpendicular to measured gravity, in the vertical
+        # plane, so it follows the learned reference instead of the CAD angle.
+        ref_norm = math.hypot(expected_y, expected_z)
+        if ref_norm < 1e-6:
+            return self.velocity_mps
+        fwd_y = -expected_z / ref_norm
+        fwd_z = expected_y / ref_norm
+        if fwd_z < 0.0:
+            fwd_y, fwd_z = -fwd_y, -fwd_z
 
         # How far measured gravity has swung from the mounted attitude. Ramps and
         # speed bumps pitch the chassis and leak gravity into the forward axis,
@@ -185,12 +233,19 @@ class ImuIntegrator:
         magnitude = math.sqrt(ax * ax + ay * ay + az * az)
         if magnitude > 1e-6:
             cos_dev = clamp(
-                (ay * expected_y + az * expected_z) / (magnitude * _GRAVITY),
+                (ay * expected_y + az * expected_z) / (magnitude * ref_norm),
                 -1.0, 1.0,
             )
             self.pitch_dev_deg = math.degrees(math.acos(cos_dev))
         else:
             self.pitch_dev_deg = 90.0
+
+        if stationary:
+            # A parked robot is going nowhere regardless of what the residual
+            # says. Without this the integrator is unbounded and ramped to
+            # 1.7 m/s in 12s on the bench while sitting still.
+            self.velocity_mps = 0.0
+            return self.velocity_mps
 
         if self.pitch_dev_deg > IMU_MAX_PITCH_DEV_DEG:
             return self.velocity_mps
@@ -241,6 +296,10 @@ class SpeedEstimator:
 
     def add_imu_gyro(self, gyro_xyz):
         self.imu.add_gyro(gyro_xyz)
+
+    def note_command(self, forward, turn):
+        """Forward the commanded duty so the IMU can tell parked from cruising."""
+        self.imu.note_command(forward, turn)
 
     def update_vision(self, bev_gray, dt, valid_mask=None):
         """Fold in a flow measurement. Call once per frame."""

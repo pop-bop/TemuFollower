@@ -322,6 +322,10 @@ def main():
                 continue
 
             if speed_estimator is not None:
+                # What the wheels were last told to do, so a parked robot can be
+                # told apart from a steady cruise -- the accelerometer reads the
+                # same either way.
+                speed_estimator.note_command(applied_forward, applied_turn)
                 # IMU samples carry their own device timestamps because the
                 # D435i motion stream is not hardware-synced to the frames.
                 for kind, xyz, ts in motion_samples:
