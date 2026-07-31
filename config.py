@@ -1,28 +1,27 @@
 # PID
-# old_working's KP=1.10 was tuned when the loop ran 320x240@120fps (~8ms/frame).
-# The loop now measures ~33ms/frame plus 2-4 frames of turn slew, so a correction
-# lands on information 4x staler: at KP=1.10 the robot crossed the line before
-# the correction unwound and the error sign flipped 38-73% of frames (measured
-# 2026-07-30). Gain must come down with loop rate; KD up a little for damping.
-# The earlier antigravity detune to KP=0.22 was the right idea overdone -- that
-# was compensating for a noise-driven input as well, which is now fixed.
-KP = 0.10
+# old_working ran KP=1.10 at 120fps and tracked cleanly. The detune to 0.10 was
+# an attempt to stop the hunting by starving the loop of authority, but that
+# treats the symptom: with the P term this small the turn command is dominated
+# by the SHARP_TURN_SPEED blend below, which injects turn by the SIGN of the
+# error alone. That is bang-bang steering -- it cannot settle, and it hunts
+# regardless of how low KP goes. The real cause was phase lag (see CAMERA_FPS);
+# with the frame period halved, the loop can carry real proportional gain again.
+# Kept a little under old_working's 1.10 because the loop is still slower than
+# 120fps.
+KP = 0.85
 KI = 0.02
-KD = 0.06
+KD = 0.14
 TURN_LIMIT = 0.80
 CENTER_DEADZONE = 0.12
 # Squaring the error to soften small corrections: also part of the above
 # compensation, and it silently halves the effective KP everywhere the line is
 # only slightly off-centre, which is most of a lap.
 NONLINEAR_ERROR_MAPPING = False
-# Flat step added past the |turn|>0.01 gate to jump the BTS7960's stiction
-# band. 0.10 was sized against KP=0.95, where the gate tripped at err~0.011;
-# at KP=0.10 the same gate trips at err~0.10 and the step was 64-89% of the
-# total command across the whole operating band -- bang-bang steering, an 11x
-# command jump between err 0.09 and 0.11. MOTOR_MIN_DUTY (0.06) already zeroes
-# sub-stiction commands at the driver, so the compensation only needs to nudge
-# the command past that threshold, not dominate it.
-TURN_DEADBAND = 0.02
+# Deadband compensation is OFF. old_working had none and drove fine: the
+# BTS7960's stiction is already handled at the driver by MOTOR_MIN_DUTY, and a
+# flat additive step here is a discontinuity in the middle of the control
+# range, which is its own oscillation source.
+TURN_DEADBAND = 0.0
 ADAPTIVE_PID_ENABLED = True
 # Was 0.55, which pushed KP from 1.10 to ~1.45 exactly when the error was
 # largest -- on top of the SHARP_TURN_SPEED blend, which is already injecting
@@ -62,13 +61,13 @@ RK4_CURVATURE_RATE_GAIN = 8.0
 CURVATURE_DAMPING = 0.0
 
 # Smooths the discrete error derivative before it feeds the PID/turn-boost math.
-# Raw frame-to-frame derivative of a noisy vision error is a classic cause of
-# oscillation on turns. This is the weight of the NEW raw sample per frame, so
-# lower = more smoothing. 0.80 (from e0ec9dd) weighted the raw diff at 80% --
-# nearly unsmoothed -- while its own comment argued for MORE smoothing at the
-# lower loop rate. 0.4 keeps ~2.5 frames of memory at ~21fps: enough to kill
-# single-frame vision noise without adding a phase lag the D term can't afford.
-DERIVATIVE_SMOOTHING = 0.40
+# Weight of the NEW raw sample per frame, so lower = more smoothing = more lag.
+# old_working used the RAW derivative (no smoothing at all) and was stable,
+# because at 120fps a single noisy frame is 8ms of influence. Every value below
+# 1.0 buys noise rejection with phase lag, and phase lag is what was making
+# this robot hunt. At 60fps a light touch is affordable; 0.7 is ~1.4 frames of
+# memory, about 12ms, versus the 68ms that 0.4 cost at 22fps.
+DERIVATIVE_SMOOTHING = 0.70
 # Hard bound on the error derivative fed to the D term, in error-units/second.
 # The observed failure: with the robot yawing, the line sweeps across the image
 # at up to ~4 err/s, the D term saturates (KD*4 = 0.9, beyond TURN_LIMIT) and
@@ -119,7 +118,14 @@ IMU_GYRO_FPS = 200
 IMU_MAX_PITCH_DEV_DEG = 12.0
 
 # SPEEDS
-SHARP_TURN_SPEED = 0.70
+# Turn injected purely by the SIGN of the error once |err| exceeds
+# CENTER_DEADZONE, blended in proportionally. old_working used 0.50; this
+# branch raised it to 0.70 while KP was cut to 0.10, which meant the blend
+# supplied 78-100% of the turn command over most of the error range -- the
+# steering became a function of sign(error) alone, with no proportional
+# component left to settle it. Back to old_working's value now that KP carries
+# real authority again.
+SHARP_TURN_SPEED = 0.50
 MAX_TURN_SPEED = 0.65
 # Global governor on forward speed, applied last on the way to the motors. 1.0 is
 # a no-op; lower it for floor testing so a runaway cannot build momentum into a
@@ -161,16 +167,20 @@ LINE_LOST_STOP_TIMEOUT_S = 4.0
 # genuinely lost line still reaches SPIN_SEARCH promptly.
 LINE_LOST_GRACE_FRAMES = 3
 SLEW_RATE_PER_S = 0.45
-# Turn was previously applied unlimited while forward was slew-limited, so a turn
-# could jump full-scale in one frame.
+# Turn slew rate. This was the single largest lag term: at 5.0/s the turn needs
+# 140ms to reach full authority, on a loop whose near ROI only shows ~100ms of
+# ground ahead. The correction was still ramping up while the ground it was
+# meant for went under the wheels, so it kept arriving late and in the wrong
+# direction -- textbook phase-lag oscillation.
 #
-# 2.5 was far too slow: at the measured ~25fps it allowed 0.10 of change per frame,
-# so reaching TURN_LIMIT took ~8 frames and the robot understeered through corners.
-# 12.0 was too fast in the other direction -- it let the turn slam between the
-# +/-MAX_TURN_SPEED rails on consecutive frames (22 sign flips in 31 samples).
-# 5.0 crosses the full +/-0.65 range in ~5 frames: fast enough not to understeer,
-# slow enough that one noisy frame cannot reverse the turn.
-TURN_SLEW_RATE_PER_S = 5.0
+# old_working had NO turn slew at all (main.py:205 applied a plain clamp) and
+# was stable, because at 120fps one frame of full-authority turn is only 8ms of
+# yaw. The slew was introduced here to tame the hunting, which made it worse.
+#
+# 25.0/s at 60fps allows 0.42 change per frame: fast enough that the turn is
+# essentially applied on the frame it is computed (~28ms to full authority),
+# while still preventing a single garbage frame from slamming rail to rail.
+TURN_SLEW_RATE_PER_S = 25.0
 # Below this the BTS7960 just buzzes the gearbox without turning it. Commands
 # under the threshold are zeroed rather than scaled up.
 MOTOR_MIN_DUTY = 0.06
@@ -228,30 +238,26 @@ MARKER_ACTION_DELAY_S = 1.0
 # before the wheels" view, so the manoeuvre fires when the latched marker
 # slips out of it: advance to put the wheels over the intersection centre,
 # then pivot until the exit line is under the near ROI again.
-GREEN_MARKER_MIN_FRAMES = 2     # consecutive sightings before the latch is trusted
 GREEN_ADVANCE_S = 0.7           # marker-under-ROI to intersection-centre at APPROACH_SPEED
 GREEN_PIVOT_TURN = 0.55
 GREEN_PIVOT_MIN_S = 0.5         # leave the current line before accepting a new one
 GREEN_PIVOT_MIN_S_UTURN = 1.4   # a U-turn must swing past the first 90 degrees
 GREEN_PIVOT_TIMEOUT_S = 3.5
 
-# --- Snake line tracer (ported from abaeyens/image-processing, RCJ 2014) ---
-# Walks the line mask bottom-up in fixed steps, giving the line's local
-# direction so green markers can be classified left/right of the LINE rather
-# than left/right of the image. Step ~ half the 25mm line width on screen;
-# window must cover the line plus some slack either side.
-SNAKE_STEP_PX = 20
-SNAKE_WINDOW_PX = 56
-SNAKE_MAX_STEPS = 24
-SNAKE_MIN_PIXELS = 40
-# RescueLine 3.6.6: markers sit JUST BEFORE the intersection, so only markers
-# within this arc length (measured along the traced line, from the robot end)
-# are the robot's own. Beyond it the marker belongs to a robot approaching the
-# same intersection from another branch -- turning on that one means obeying
-# someone else's instruction. Sized against the near ROI's ~91px depth plus
-# the marker-to-intersection gap: a marker one ROI-depth ahead is still mine,
-# one on the far side of the intersection is not.
-SNAKE_MARKER_MAX_AHEAD_PX = 110
+# --- Green marker decision graph (markers.py) ------------------------------
+# Rows the marker may occupy, as a fraction of frame height. This IS rule
+# 3.6.6 ("markers are placed just before the intersection"): only ground the
+# robot is about to reach can vote. A marker beyond the intersection belongs
+# to a robot approaching from another branch.
+MARKER_BAND_Y_START = 0.55
+MARKER_BAND_Y_END = 0.98
+# How far from the line's fitted centre a blob may sit and still be its
+# marker. A 25mm marker abuts a 25mm line, so a couple of line widths. Beyond
+# this it is evacuation-zone green or off-tile clutter.
+MARKER_MAX_LINE_DIST_PX = 90
+# Consecutive frames the same verdict must repeat before it is acted on. One
+# frame of green is a reflection; a real marker persists as the robot closes.
+MARKER_CONFIRM_FRAMES = 3
 
 # --- Follow-the-gap depth avoidance (see depth_nav.py) ----------------------
 # Steers around the obstacle on live depth while it is still 300-500mm out,
@@ -277,10 +283,25 @@ GAP_ENGAGE_RANGE_MM = 450.0
 GAP_COMMIT_RANGE_MM = 200.0
 
 # Camera
-CAMERA_WIDTH = 640
-CAMERA_HEIGHT = 480
-# Reduced from 30 to 15 so Color + Depth + IMU can all fit over a USB 2.0 cable!
-CAMERA_FPS = 30
+# THE OSCILLATION FIX. old_working ran 320x240@120fps and was stable; this
+# branch moved to 640x480@30 and started hunting. The link is USB-2 (the D435i
+# reports usb_type_descriptor 2.1), which sustains roughly 30 MB/s. Colour plus
+# depth at 640x480x30 asks for ~37 MB/s, so the pipeline never reached 30fps --
+# measured 45ms/frame, i.e. 22fps.
+#
+# That frame period is the base term in the loop's phase lag, and the lag is
+# what oscillates: at 22fps the total control lag was ~254ms while the near ROI
+# only shows ~100ms of ground ahead at BASE_SPEED. Every correction landed on
+# ground the robot had already crossed, so it corrected the wrong way and
+# reversed on the next frame. old_working's ratio was 8.3ms lag against 24.3ms
+# horizon -- comfortably inside its own sight line.
+#
+# 424x240 is a native D435 colour mode (not a crop), so 60fps fits in ~24 MB/s
+# with depth. Halving the frame period roughly halves the dominant lag term.
+# The ROI ratios are fractions of frame height, so they follow automatically.
+CAMERA_WIDTH = 424
+CAMERA_HEIGHT = 240
+CAMERA_FPS = 60
 USB_CAMERA_INDEX = 0
 
 # Motor pins (BCM numbering) -- RPi drives the two IBT-2/BTS7960 boards directly.
@@ -366,7 +387,11 @@ ROI_VIEW_SCALE = 3
 ARROW_MAX_DEFLECTION_DEG = 65.0
 
 # RealSense & Perspective Configs
-CAMERA_TILT_ANGLE_DEG = 25.0
+# Measured mount: 22.5 degrees below horizontal. This feeds
+# get_expected_depth_map, so an error here biases the whole expected-floor
+# model and therefore every obstacle decision -- 25.0 was making the predicted
+# floor nearer than it really is at every row.
+CAMERA_TILT_ANGLE_DEG = 22.5
 CAMERA_MOUNT_HEIGHT_MM = 60.0
 
 WARP_MATRIX = [

@@ -63,7 +63,7 @@ from config import (
     OBSTACLE_MANEUVER_SPEED, OBSTACLE_MANEUVER_TURN,
     OBSTACLE_PIVOT_90_S, OBSTACLE_CLEAR_S, OBSTACLE_PASS_S,
     OBSTACLE_RETURN_TIMEOUT_S,
-    GREEN_MARKER_MIN_FRAMES, GREEN_ADVANCE_S, GREEN_PIVOT_TURN,
+    GREEN_ADVANCE_S, GREEN_PIVOT_TURN,
     GREEN_PIVOT_MIN_S, GREEN_PIVOT_MIN_S_UTURN, GREEN_PIVOT_TIMEOUT_S,
     GAP_NAV_ENABLED, GAP_STEER_GAIN, GAP_ENGAGE_RANGE_MM, GAP_COMMIT_RANGE_MM,
 )
@@ -77,6 +77,7 @@ from vision import (
 )
 from pi_motors import create_motors
 from depth_nav import gap_steer
+import markers
 from vision import get_warp_matrix, warp_frame, get_expected_depth_map, get_obstacle_mask
 from camera import get_depth_scale
 from config import CAMERA_TILT_ANGLE_DEG, CAMERA_MOUNT_HEIGHT_MM, OBSTACLE_DETECTION_ENABLED
@@ -256,12 +257,10 @@ def main():
     prev_green_marker = False
     pending_marker_color = None
     pending_marker_action_time = None
-    green_left_frames = 0
-    green_right_frames = 0
-    green_gone_frames = 0
     green_turn_dir = 1.0
     green_uturn = False
     green_leg_start = 0.0
+    marker_decider = markers.MarkerDecider()
     halted = False
     buffer = TemporalBuffer(max_size=MAX_WAYPOINTS)
     backtrack_intersection_wp = None
@@ -1026,36 +1025,26 @@ def main():
                 prev_green_marker = green_marker
                 prev_red_marker = red_marker
 
-                # GREEN MARKERS (RescueLine 3.6): accumulate sightings while
-                # the marker crosses the near ROI, latch on the direction once
-                # seen for GREEN_MARKER_MIN_FRAMES, and FIRE when the marker
-                # leaves the ROI -- at that moment the wheels are just short of
-                # the intersection, which is where the manoeuvre must begin.
-                # Both sides seen = dead end, turn around (3.6.4).
-                if normal_debug.get("green_left", False):
-                    green_left_frames += 1
-                if normal_debug.get("green_right", False):
-                    green_right_frames += 1
+                # GREEN MARKERS (RescueLine 3.6) -- see markers.py for the
+                # decision graph. The decider owns the whole verdict, including
+                # the confirm-frames debounce, so this is just: ask, and act on
+                # a committed answer. Only run when the marker mask has
+                # something in it, which keeps the fit off the hot path on the
+                # frames (the vast majority) that have no green at all.
                 if green_marker:
-                    green_gone_frames = 0
-                else:
-                    green_gone_frames += 1
-                    seen_l = green_left_frames >= GREEN_MARKER_MIN_FRAMES
-                    seen_r = green_right_frames >= GREEN_MARKER_MIN_FRAMES
-                    if green_gone_frames >= 2 and (seen_l or seen_r):
-                        green_uturn = seen_l and seen_r
-                        green_turn_dir = -1.0 if seen_l else 1.0
+                    decision, _raw, _info = marker_decider.update(frame)
+                    if decision != markers.GO_STRAIGHT:
+                        green_uturn = decision == markers.U_TURN
+                        green_turn_dir = -1.0 if decision == markers.TURN_LEFT else 1.0
                         green_leg_start = now
-                        green_left_frames = 0
-                        green_right_frames = 0
+                        marker_decider.reset()
                         state = "GREEN_ADVANCE"
                         print("GREEN MARKER: "
                               + ("DEAD END -- turning around" if green_uturn
                                  else "turn LEFT" if green_turn_dir < 0
                                  else "turn RIGHT"))
-                    elif green_gone_frames >= 2:
-                        green_left_frames = 0
-                        green_right_frames = 0
+                else:
+                    marker_decider.reset()
 
             # ----- LINE LOST: APPROACH or SPIN_SEARCH -----
             else:
