@@ -30,7 +30,7 @@ ADAPTIVE_PID_ENABLED = True
 # one loop drove 73% turn-sign flips over 12 consecutive FOLLOW frames on the
 # 2026-07-30 runs. The blend is the one that has to stay (it is how the robot
 # gets around corners), so this one gives way.
-ADAPTIVE_KP_ERROR_BOOST = 1.0
+ADAPTIVE_KP_ERROR_BOOST = 0.0
 ADAPTIVE_KP_CONFIDENCE_DROP = 0.50
 ADAPTIVE_KD_ERROR_BOOST = 1.0
 ADAPTIVE_KD_DERIVATIVE_BOOST = 1.0

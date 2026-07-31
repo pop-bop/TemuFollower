@@ -289,7 +289,20 @@ def main():
     print(f"Starting speed: BASE_SPEED={BASE_SPEED}  MAX_SPEED={MAX_SPEED}  MIN_SPEED={MIN_SPEED}")
 
     try:
+        from gui import Dashboard
+        dashboard = Dashboard(globals())
+    except Exception as e:
+        print(f"Could not load Dashboard GUI: {e}")
+        dashboard = None
+
+    try:
         while True:
+            if dashboard is not None:
+                try:
+                    dashboard.pump_events()
+                except Exception:
+                    pass
+                    
             now = time.perf_counter()
             dt = max(0.001, now - last_time)
             last_time = now
@@ -439,10 +452,7 @@ def main():
                 )
                 obstacle_at_standoff = obstacle_tracker.update(obstacle_band)
                 if GAP_NAV_ENABLED:
-                    gap_nav = gap_steer(
-                        depth_frame.astype(np.float32) * (depth_scale * 1000.0),
-                        expected_depth_map,
-                    )
+                    gap_nav = gap_steer(depth_frame, depth_scale, expected_depth_map)
 
             if halted:
                 motors.stop()
@@ -1218,6 +1228,14 @@ def main():
                     f"fps={fps_ema:.1f} pid={current_kp:.2f}/{current_ki:.2f}/{current_kd:.2f} "
                     f"curve={curve_sharpness:.2f}/{curve_speed_scale:.2f}{odo}"
                 )
+
+            if dashboard is not None:
+                display_speed = speed_estimator.speed_mps if speed_estimator is not None else applied_forward
+                try:
+                    dashboard.update_state(frame, display_speed, state, applied_left, applied_right)
+                except Exception:
+                    pass
+
     except KeyboardInterrupt:
         print("stopping")
 

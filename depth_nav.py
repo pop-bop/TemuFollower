@@ -99,8 +99,12 @@ def find_gap(blocked, closest_col=None):
     return best_start, best_start + best_len, best_start + best_len // 2
 
 
-def gap_steer(depth_mm, expected_map):
+def gap_steer(depth_frame, depth_scale, expected_map):
     """One avoidance decision from one depth frame.
+
+    Takes the raw depth frame and its scale rather than millimetres, so the
+    unit conversion lives with the rest of the depth math instead of at the
+    call site.
 
     Returns a dict describing what the depth sees and where to aim:
       obstacle_mm  range to the nearest obstacle, None if the view is clear
@@ -109,9 +113,10 @@ def gap_steer(depth_mm, expected_map):
     """
     result = {"obstacle_mm": None, "steer": None, "gap_width": 0.0,
               "blocked_frac": 0.0}
-    if depth_mm is None or expected_map is None:
+    if depth_frame is None or expected_map is None:
         return result
 
+    depth_mm = depth_frame.astype(np.float32) * (depth_scale * 1000.0)
     ranges, blocked = depth_to_scan(depth_mm, expected_map)
     w = len(ranges)
     result["blocked_frac"] = float(blocked.mean())
