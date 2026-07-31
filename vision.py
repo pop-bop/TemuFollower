@@ -14,8 +14,11 @@ from config import (
     WARP_MATRIX, GROUND_DEPTH_TOLERANCE_MM, OBSTACLE_DETECTION_ENABLED,
     OBSTACLE_BAND_ENABLED,
     OBSTACLE_BAND_MIN_WIDTH_RATIO, OBSTACLE_BAND_MAX_RANGE_MM,
+    OBSTACLE_BAND_IGNORE_BELOW_FRAC,
 )
 from utils import clamp
+from snake import classify_green_markers
+from config import SNAKE_MARKER_MAX_AHEAD_PX
 
 def get_warp_matrix():
     return np.array(WARP_MATRIX, dtype=np.float32)
@@ -86,6 +89,11 @@ def detect_obstacle_band(depth_frame, depth_scale, expected_map=None):
 
     depth_mm = depth_frame.astype(np.float32) * (depth_scale * 1000.0)
     h, w = depth_mm.shape[:2]
+    # The bottom rows image floor inside the sensor's blind zone, where USB-2
+    # depth reads garbage non-zero values that beat the expected-floor map and
+    # paint phantom bands. An upright obstacle is anchored at the TOP of the
+    # frame (all rays point down), so dropping the bottom costs nothing.
+    depth_mm[int(h * OBSTACLE_BAND_IGNORE_BELOW_FRAC):, :] = 0.0
     valid = depth_mm > 0
     result["any_valid_depth"] = bool(valid.any())
     if not result["any_valid_depth"]:
@@ -194,6 +202,8 @@ def find_line_error(frame, obstacle_mask, y_start_ratio, y_end_ratio, x_start_ra
         "roi_frame": roi,
         "red_marker": False,
         "green_marker": cv2.countNonZero(green_mask) >= MIN_MARKER_AREA,
+        "green_left": False,
+        "green_right": False,
         "line_area": 0.0,
         "line_confidence": 0.0,
         "obstacle_detected": cv2.countNonZero(obs_roi) > 0
@@ -246,6 +256,20 @@ def find_line_error(frame, obstacle_mask, y_start_ratio, y_end_ratio, x_start_ra
 
     cx_roi = int(M["m10"] / M["m00"])
     cy_roi = int(M["m01"] / M["m00"])
+
+    # Which side of the LINE each green marker sits on (RescueLine 3.6: left
+    # marker = turn left, right = turn right, both = dead end / turn around).
+    # The snake trace gives the line's LOCAL direction, so a marker beside a
+    # corner entered at an angle is still judged correctly -- against the
+    # line, not the image axis. Only blobs near the line count: green
+    # evacuation triangles and stray off-tile objects must not latch a turn.
+    green_near = cv2.bitwise_and(near_line_zone, green_mask)
+    if cv2.countNonZero(green_near) >= MIN_MARKER_AREA:
+        gl, gr_side, _ = classify_green_markers(
+            black_mask, green_near, MIN_MARKER_AREA / 2,
+            max_ahead_px=SNAKE_MARKER_MAX_AHEAD_PX)
+        debug_info["green_left"] = gl
+        debug_info["green_right"] = gr_side
     cx_global = cx_roi + x0
     cy_global = cy_roi + y0
     center_x_global = x0 + roi_w // 2

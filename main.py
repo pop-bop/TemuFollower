@@ -60,8 +60,12 @@ from config import (
     ODOMETRY_ENABLED, BEV_ENABLED, BEV_NEAR_MM, BEV_CAMERA_AXLE_OFFSET_MM,
     OBSTACLE_BAND_ENABLED, OBSTACLE_BAND_MIN_FRAMES, OBSTACLE_DROPOUT_FRAMES,
     OBSTACLE_DROPOUT_MAX_RANGE_MM, OBSTACLE_TRIGGER_ON_DROPOUT,
-    OBSTACLE_LATERAL_OFFSET_MM, OBSTACLE_PASS_FORWARD_MM, OBSTACLE_REACQUIRE_MM,
-    OBSTACLE_MANEUVER_SPEED, OBSTACLE_MANEUVER_TURN, OBSTACLE_LEG_TIMEOUT_S,
+    OBSTACLE_MANEUVER_SPEED, OBSTACLE_MANEUVER_TURN,
+    OBSTACLE_PIVOT_90_S, OBSTACLE_CLEAR_S, OBSTACLE_PASS_S,
+    OBSTACLE_RETURN_TIMEOUT_S,
+    GREEN_MARKER_MIN_FRAMES, GREEN_ADVANCE_S, GREEN_PIVOT_TURN,
+    GREEN_PIVOT_MIN_S, GREEN_PIVOT_MIN_S_UTURN, GREEN_PIVOT_TIMEOUT_S,
+    GAP_NAV_ENABLED, GAP_STEER_GAIN, GAP_ENGAGE_RANGE_MM, GAP_COMMIT_RANGE_MM,
 )
 from camera import (
     open_camera, read_frame, read_frame_with_motion, has_imu, get_intrinsics,
@@ -72,6 +76,7 @@ from vision import (
     detect_obstacle_band,
 )
 from pi_motors import create_motors
+from depth_nav import gap_steer
 from vision import get_warp_matrix, warp_frame, get_expected_depth_map, get_obstacle_mask
 from camera import get_depth_scale
 from config import CAMERA_TILT_ANGLE_DEG, CAMERA_MOUNT_HEIGHT_MM, OBSTACLE_DETECTION_ENABLED
@@ -171,15 +176,15 @@ class ObstacleTracker:
         return self.dropout_frames >= OBSTACLE_DROPOUT_FRAMES
 
 
-def obstacle_leg_done(estimator, mark, target_mm, started_at, now):
-    """True once a manoeuvre leg has run its distance, or timed out.
+def obstacle_leg_elapsed(started_at, now, duration_s):
+    """True once a timed manoeuvre leg has run its course.
 
-    The timeout is the safety net: if flow dies on a featureless floor the
-    odometer stops advancing and the leg would otherwise never finish.
+    Legs are TIMED, not dead-reckoned: there are no encoders and the IMU is
+    disabled on the USB-2 link, so a mm-denominated leg had nothing to measure
+    against -- obstacle_leg_done fell through to its 6s timeout on every leg
+    and the whole go-around became a 6-second blind arc per leg.
     """
-    if estimator is not None and estimator.travelled_since(mark) >= target_mm:
-        return True
-    return (now - started_at) >= OBSTACLE_LEG_TIMEOUT_S
+    return (now - started_at) >= duration_s
 
 
 def sigterm_handler(signum, frame):
@@ -228,7 +233,6 @@ def main():
 
     obstacle_tracker = ObstacleTracker()
     obstacle_leg = None
-    obstacle_leg_mark = 0.0
     obstacle_leg_start = 0.0
     obstacle_pass_left = True
     obstacle_retried = False
@@ -252,6 +256,12 @@ def main():
     prev_green_marker = False
     pending_marker_color = None
     pending_marker_action_time = None
+    green_left_frames = 0
+    green_right_frames = 0
+    green_gone_frames = 0
+    green_turn_dir = 1.0
+    green_uturn = False
+    green_leg_start = 0.0
     halted = False
     buffer = TemporalBuffer(max_size=MAX_WAYPOINTS)
     backtrack_intersection_wp = None
@@ -420,6 +430,7 @@ def main():
             # one: expected_depth_map is derived from unwarped camera geometry.
             obstacle_at_standoff = False
             obstacle_band = None
+            gap_nav = None
             if (OBSTACLE_BAND_ENABLED and depth_frame is not None
                     and expected_depth_map is not None
                     and not state.startswith("OBSTACLE")):
@@ -427,6 +438,11 @@ def main():
                     depth_frame, depth_scale, expected_depth_map,
                 )
                 obstacle_at_standoff = obstacle_tracker.update(obstacle_band)
+                if GAP_NAV_ENABLED:
+                    gap_nav = gap_steer(
+                        depth_frame.astype(np.float32) * (depth_scale * 1000.0),
+                        expected_depth_map,
+                    )
 
             if halted:
                 motors.stop()
@@ -526,10 +542,9 @@ def main():
                 obstacle_pass_left = (obstacle_tracker.prefer_left
                                       if obstacle_tracker.prefer_left is not None else True)
                 obstacle_retried = False
-                obstacle_leg = "CLEAR"
-                obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
+                obstacle_leg = "TURN_AWAY"
                 obstacle_leg_start = now
-                state = "OBSTACLE_CLEAR"
+                state = "OBSTACLE_TURN_AWAY"
                 motors.stop()
                 print(f"OBSTACLE at ~{obstacle_tracker.last_range_mm:.0f}mm "
                       f"(depth dropout) -- passing "
@@ -544,16 +559,38 @@ def main():
                 if STEER_INVERT:
                     leg_turn = -leg_turn
 
-                if obstacle_leg == "CLEAR":
-                    # Arc away from the line until clear of the obstacle's width.
-                    target_forward = OBSTACLE_MANEUVER_SPEED
+                # Timed "box" around the obstacle: pivot 90 away, sidestep,
+                # pivot back parallel, pass, pivot toward the line, drive until
+                # the near ROI picks the line up again. A skid-steer pivots in
+                # place cleanly, so square legs beat a blind arc -- and every
+                # leg is watched by the line ROIs on the way, so the box exits
+                # early the moment the line reappears where it is expected.
+                if obstacle_leg == "TURN_AWAY":
+                    # Pivot 90 degrees away from the line.
+                    target_forward = 0.0
                     target_turn = leg_turn
                     display_turn = leg_turn
-                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
-                                         OBSTACLE_LATERAL_OFFSET_MM,
-                                         obstacle_leg_start, now):
+                    if obstacle_leg_elapsed(obstacle_leg_start, now, OBSTACLE_PIVOT_90_S):
+                        obstacle_leg = "CLEAR_FWD"
+                        obstacle_leg_start = now
+                        state = "OBSTACLE_CLEAR_FWD"
+
+                elif obstacle_leg == "CLEAR_FWD":
+                    # Sidestep: drive straight to clear the obstacle laterally.
+                    target_forward = OBSTACLE_MANEUVER_SPEED
+                    target_turn = 0.0
+                    if obstacle_leg_elapsed(obstacle_leg_start, now, OBSTACLE_CLEAR_S):
+                        obstacle_leg = "TURN_PARALLEL"
+                        obstacle_leg_start = now
+                        state = "OBSTACLE_TURN_PARALLEL"
+
+                elif obstacle_leg == "TURN_PARALLEL":
+                    # Pivot back 90 to face parallel to the line again.
+                    target_forward = 0.0
+                    target_turn = -leg_turn
+                    display_turn = -leg_turn
+                    if obstacle_leg_elapsed(obstacle_leg_start, now, OBSTACLE_PIVOT_90_S):
                         obstacle_leg = "PASS"
-                        obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
                         obstacle_leg_start = now
                         state = "OBSTACLE_PASS"
 
@@ -561,21 +598,28 @@ def main():
                     # Run straight past the obstacle.
                     target_forward = OBSTACLE_MANEUVER_SPEED
                     target_turn = 0.0
-                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
-                                         OBSTACLE_PASS_FORWARD_MM,
-                                         obstacle_leg_start, now):
+                    if obstacle_leg_elapsed(obstacle_leg_start, now, OBSTACLE_PASS_S):
+                        obstacle_leg = "TURN_BACK"
+                        obstacle_leg_start = now
+                        state = "OBSTACLE_TURN_BACK"
+
+                elif obstacle_leg == "TURN_BACK":
+                    # Pivot 90 to face back toward the line.
+                    target_forward = 0.0
+                    target_turn = -leg_turn
+                    display_turn = -leg_turn
+                    if obstacle_leg_elapsed(obstacle_leg_start, now, OBSTACLE_PIVOT_90_S):
                         obstacle_leg = "RETURN"
-                        obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
                         obstacle_leg_start = now
                         state = "OBSTACLE_RETURN"
 
                 elif obstacle_leg == "RETURN":
-                    # Cut back toward the line, watching for it the whole way so
-                    # a short obstacle does not overshoot the return.
+                    # Cross back toward the line, watching for it the whole way.
                     target_forward = OBSTACLE_MANEUVER_SPEED
-                    target_turn = -leg_turn
-                    display_turn = -leg_turn
-                    if normal_error is not None:
+                    target_turn = 0.0
+                    wide_err, wide_debug = find_line_error_wide(frame, obstacle_mask)
+                    active_debug = wide_debug
+                    if normal_error is not None or wide_err is not None:
                         print("OBSTACLE: line reacquired")
                         obstacle_tracker.reset()
                         obstacle_leg = None
@@ -585,42 +629,14 @@ def main():
                         reset_trajectory_state(curvature_state)
                         integral = 0.0
                         continue
-                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
-                                         OBSTACLE_LATERAL_OFFSET_MM,
-                                         obstacle_leg_start, now):
-                        obstacle_leg = "REACQUIRE"
-                        obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
-                        obstacle_leg_start = now
-                        state = "OBSTACLE_REACQUIRE"
-
-                elif obstacle_leg == "REACQUIRE":
-                    # Creep forward hunting for the line. The wide ROI is used
-                    # because the line may still be off to one side.
-                    wide_err, wide_debug = find_line_error_wide(frame, obstacle_mask)
-                    active_debug = wide_debug
-                    if normal_error is not None or wide_err is not None:
-                        print("OBSTACLE: line reacquired (wide)")
-                        obstacle_tracker.reset()
-                        obstacle_leg = None
-                        state = "FOLLOW"
-                        vision_delay_queue.clear()
-                        reset_trajectory_state(trajectory_state)
-                        reset_trajectory_state(curvature_state)
-                        integral = 0.0
-                        continue
-
-                    target_forward = OBSTACLE_MANEUVER_SPEED * 0.8
-                    target_turn = 0.0
-                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
-                                         OBSTACLE_REACQUIRE_MM,
-                                         obstacle_leg_start, now):
+                    if obstacle_leg_elapsed(obstacle_leg_start, now,
+                                            OBSTACLE_RETURN_TIMEOUT_S):
                         if not obstacle_retried:
                             # Wrong side, or the obstacle was wider than assumed.
                             # Reverse out and try the other way around.
                             obstacle_retried = True
                             obstacle_pass_left = not obstacle_pass_left
                             obstacle_leg = "BACKOUT"
-                            obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
                             obstacle_leg_start = now
                             state = "OBSTACLE_BACKOUT"
                             print("OBSTACLE: no line -- backing out to retry "
@@ -633,17 +649,14 @@ def main():
                             spin_start_time = now
 
                 elif obstacle_leg == "BACKOUT":
-                    # Retrace far enough to be beside the obstacle again before
-                    # arcing the other way.
+                    # Retrace the failed crossing before trying the other side.
                     target_forward = -OBSTACLE_MANEUVER_SPEED
                     target_turn = 0.0
-                    if obstacle_leg_done(speed_estimator, obstacle_leg_mark,
-                                         OBSTACLE_PASS_FORWARD_MM + OBSTACLE_REACQUIRE_MM,
-                                         obstacle_leg_start, now):
-                        obstacle_leg = "CLEAR"
-                        obstacle_leg_mark = speed_estimator.mark() if speed_estimator else 0.0
+                    if obstacle_leg_elapsed(obstacle_leg_start, now,
+                                            OBSTACLE_RETURN_TIMEOUT_S + OBSTACLE_PASS_S):
+                        obstacle_leg = "TURN_AWAY"
                         obstacle_leg_start = now
-                        state = "OBSTACLE_CLEAR"
+                        state = "OBSTACLE_TURN_AWAY"
 
             # ----- BACKTRACK: reverse along the line to reach last intersection -----
             elif state == "BACKTRACK":
@@ -742,6 +755,53 @@ def main():
                         else:
                             target_forward = 0.0
                             target_turn = ROTATE_SPEED * 0.5 if not STEER_INVERT else -ROTATE_SPEED * 0.5
+
+            # ----- GREEN MARKER: advance to the intersection, then pivot -----
+            # RescueLine 3.6: the 25mm marker sits JUST BEFORE the intersection
+            # and names the exit; two markers (one each side) mean dead end,
+            # turn around. The latch fired when the marker slipped out of the
+            # near ROI, so the wheels are roughly a ROI-depth short of the
+            # intersection centre: cover that gap first, then pivot until the
+            # exit line is back under the near ROI.
+            elif state == "GREEN_ADVANCE":
+                target_forward = APPROACH_SPEED
+                target_turn = 0.0
+                display_turn = 0.0
+                if now - green_leg_start >= GREEN_ADVANCE_S:
+                    green_leg_start = now
+                    state = "GREEN_PIVOT"
+                    label = ("U-TURN" if green_uturn
+                             else "LEFT" if green_turn_dir < 0 else "RIGHT")
+                    print(f"GREEN: pivoting {label}")
+
+            elif state == "GREEN_PIVOT":
+                turn = GREEN_PIVOT_TURN * green_turn_dir
+                if STEER_INVERT:
+                    turn = -turn
+                target_forward = 0.0
+                target_turn = turn
+                display_turn = turn
+                # The line being LEFT is the first thing the pivot sees, so a
+                # minimum swing is required before any reacquisition counts --
+                # longer for a dead-end U-turn, which must get past the branch
+                # it arrived on as well.
+                min_s = GREEN_PIVOT_MIN_S_UTURN if green_uturn else GREEN_PIVOT_MIN_S
+                elapsed = now - green_leg_start
+                if elapsed >= min_s and normal_error is not None \
+                        and abs(normal_error) < CENTER_DEADZONE * 2:
+                    print("GREEN: exit line centered, following")
+                    integral = 0.0
+                    last_error = 0.0
+                    smoothed_derivative = 0.0
+                    reset_trajectory_state(trajectory_state)
+                    reset_trajectory_state(curvature_state)
+                    vision_delay_queue.clear()
+                    state = "FOLLOW"
+                elif elapsed >= GREEN_PIVOT_TIMEOUT_S:
+                    print("GREEN: pivot timed out -- searching")
+                    search_direction = green_turn_dir
+                    state = "SPIN_SEARCH"
+                    spin_start_time = now
 
             # ----- NORMAL LINE FOLLOWING -----
             # Coast through a brief near-ROI dropout instead of dropping straight
@@ -843,7 +903,27 @@ def main():
                 # RK4 introduces a 100ms phase lag (10 rad/s), and vision delay
                 # introduces more. Phase lag in the primary error causes oscillation.
                 raw_error = clamp(trajectory_target_error, -1.0, 1.0)
-                
+
+                # Follow-the-gap: while an obstacle is still measurable, bias
+                # the tracking error toward the free space beside it, so the
+                # robot eases around on live depth instead of driving up to it
+                # and then manoeuvring blind. Authority ramps in as the
+                # obstacle closes; the timed box (below) is only reached if the
+                # obstacle gets inside the sensor's minimum range anyway.
+                if (gap_nav is not None and gap_nav["steer"] is not None
+                        and gap_nav["obstacle_mm"] is not None
+                        and GAP_COMMIT_RANGE_MM < gap_nav["obstacle_mm"]
+                        <= GAP_ENGAGE_RANGE_MM):
+                    closeness = clamp(
+                        (GAP_ENGAGE_RANGE_MM - gap_nav["obstacle_mm"])
+                        / max(1.0, GAP_ENGAGE_RANGE_MM - GAP_COMMIT_RANGE_MM),
+                        0.0, 1.0,
+                    )
+                    raw_error = clamp(
+                        raw_error + GAP_STEER_GAIN * closeness * gap_nav["steer"],
+                        -1.0, 1.0,
+                    )
+
                 if NONLINEAR_ERROR_MAPPING:
                     error = (raw_error ** 2) * (1.0 if raw_error > 0 else -1.0)
                 else:
@@ -933,12 +1013,39 @@ def main():
                     print(f"RED MARKER: stopping in {MARKER_ACTION_DELAY_S:.1f}s")
                     pending_marker_color = "red"
                     pending_marker_action_time = now + MARKER_ACTION_DELAY_S
-                elif green_marker and not prev_green_marker and pending_marker_color is None:
-                    print(f"GREEN MARKER: continuing in {MARKER_ACTION_DELAY_S:.1f}s")
-                    pending_marker_color = "green"
-                    pending_marker_action_time = now + MARKER_ACTION_DELAY_S
                 prev_green_marker = green_marker
                 prev_red_marker = red_marker
+
+                # GREEN MARKERS (RescueLine 3.6): accumulate sightings while
+                # the marker crosses the near ROI, latch on the direction once
+                # seen for GREEN_MARKER_MIN_FRAMES, and FIRE when the marker
+                # leaves the ROI -- at that moment the wheels are just short of
+                # the intersection, which is where the manoeuvre must begin.
+                # Both sides seen = dead end, turn around (3.6.4).
+                if normal_debug.get("green_left", False):
+                    green_left_frames += 1
+                if normal_debug.get("green_right", False):
+                    green_right_frames += 1
+                if green_marker:
+                    green_gone_frames = 0
+                else:
+                    green_gone_frames += 1
+                    seen_l = green_left_frames >= GREEN_MARKER_MIN_FRAMES
+                    seen_r = green_right_frames >= GREEN_MARKER_MIN_FRAMES
+                    if green_gone_frames >= 2 and (seen_l or seen_r):
+                        green_uturn = seen_l and seen_r
+                        green_turn_dir = -1.0 if seen_l else 1.0
+                        green_leg_start = now
+                        green_left_frames = 0
+                        green_right_frames = 0
+                        state = "GREEN_ADVANCE"
+                        print("GREEN MARKER: "
+                              + ("DEAD END -- turning around" if green_uturn
+                                 else "turn LEFT" if green_turn_dir < 0
+                                 else "turn RIGHT"))
+                    elif green_gone_frames >= 2:
+                        green_left_frames = 0
+                        green_right_frames = 0
 
             # ----- LINE LOST: APPROACH or SPIN_SEARCH -----
             else:
@@ -1021,12 +1128,8 @@ def main():
                             target_turn = 0.0
 
             if pending_marker_color is not None and now >= pending_marker_action_time:
-                if pending_marker_color == "green":
-                    print("GREEN MARKER: continuing")
-                    pass
-                elif pending_marker_color == "red":
+                if pending_marker_color == "red":
                     print("RED MARKER: stopping")
-                    pass
                     motors.stop()
                     halted = True
                 pending_marker_color = None

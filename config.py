@@ -15,7 +15,14 @@ CENTER_DEADZONE = 0.12
 # compensation, and it silently halves the effective KP everywhere the line is
 # only slightly off-centre, which is most of a lap.
 NONLINEAR_ERROR_MAPPING = False
-TURN_DEADBAND = 0.10
+# Flat step added past the |turn|>0.01 gate to jump the BTS7960's stiction
+# band. 0.10 was sized against KP=0.95, where the gate tripped at err~0.011;
+# at KP=0.10 the same gate trips at err~0.10 and the step was 64-89% of the
+# total command across the whole operating band -- bang-bang steering, an 11x
+# command jump between err 0.09 and 0.11. MOTOR_MIN_DUTY (0.06) already zeroes
+# sub-stiction commands at the driver, so the compensation only needs to nudge
+# the command past that threshold, not dominate it.
+TURN_DEADBAND = 0.02
 ADAPTIVE_PID_ENABLED = True
 # Was 0.55, which pushed KP from 1.10 to ~1.45 exactly when the error was
 # largest -- on top of the SHARP_TURN_SPEED blend, which is already injecting
@@ -56,10 +63,12 @@ CURVATURE_DAMPING = 0.0
 
 # Smooths the discrete error derivative before it feeds the PID/turn-boost math.
 # Raw frame-to-frame derivative of a noisy vision error is a classic cause of
-# oscillation on turns. Lowered from 0.4: that was chosen for a 120fps loop where
-# smoothing cost little phase, but at the measured ~21fps it lags the one term
-# that could compensate for everything else the loop lost. old_working had none.
-DERIVATIVE_SMOOTHING = 0.80
+# oscillation on turns. This is the weight of the NEW raw sample per frame, so
+# lower = more smoothing. 0.80 (from e0ec9dd) weighted the raw diff at 80% --
+# nearly unsmoothed -- while its own comment argued for MORE smoothing at the
+# lower loop rate. 0.4 keeps ~2.5 frames of memory at ~21fps: enough to kill
+# single-frame vision noise without adding a phase lag the D term can't afford.
+DERIVATIVE_SMOOTHING = 0.40
 # Hard bound on the error derivative fed to the D term, in error-units/second.
 # The observed failure: with the robot yawing, the line sweeps across the image
 # at up to ~4 err/s, the D term saturates (KD*4 = 0.9, beyond TURN_LIMIT) and
@@ -161,7 +170,7 @@ SLEW_RATE_PER_S = 0.45
 # +/-MAX_TURN_SPEED rails on consecutive frames (22 sign flips in 31 samples).
 # 5.0 crosses the full +/-0.65 range in ~5 frames: fast enough not to understeer,
 # slow enough that one noisy frame cannot reverse the turn.
-TURN_SLEW_RATE_PER_S = 15.0
+TURN_SLEW_RATE_PER_S = 5.0
 # Below this the BTS7960 just buzzes the gearbox without turning it. Commands
 # under the threshold are zeroed rather than scaled up.
 MOTOR_MIN_DUTY = 0.06
@@ -207,11 +216,65 @@ MIN_LINE_AREA = 180
 # ~9700px in the near ROI at 640x480, so full confidence sits a little under
 # that and a half-visible line scores ~0.5 instead of saturating.
 LINE_CONFIDENCE_FULL_AREA = 8000
-PICAMERA2_RGB_TO_BGR = False
 GREEN_DIFF_THRESHOLD = 40
 RED_DIFF_THRESHOLD = 40
 MIN_MARKER_AREA = 800
 MARKER_ACTION_DELAY_S = 1.0
+
+# --- Green intersection markers (RescueLine 3.6) ---------------------------
+# 25x25mm green squares sit JUST BEFORE an intersection and name the exit:
+# marker left of the line = turn left, right = turn right, one on EACH side =
+# dead end, turn around. No marker = straight on. The near ROI is the "just
+# before the wheels" view, so the manoeuvre fires when the latched marker
+# slips out of it: advance to put the wheels over the intersection centre,
+# then pivot until the exit line is under the near ROI again.
+GREEN_MARKER_MIN_FRAMES = 2     # consecutive sightings before the latch is trusted
+GREEN_ADVANCE_S = 0.7           # marker-under-ROI to intersection-centre at APPROACH_SPEED
+GREEN_PIVOT_TURN = 0.55
+GREEN_PIVOT_MIN_S = 0.5         # leave the current line before accepting a new one
+GREEN_PIVOT_MIN_S_UTURN = 1.4   # a U-turn must swing past the first 90 degrees
+GREEN_PIVOT_TIMEOUT_S = 3.5
+
+# --- Snake line tracer (ported from abaeyens/image-processing, RCJ 2014) ---
+# Walks the line mask bottom-up in fixed steps, giving the line's local
+# direction so green markers can be classified left/right of the LINE rather
+# than left/right of the image. Step ~ half the 25mm line width on screen;
+# window must cover the line plus some slack either side.
+SNAKE_STEP_PX = 20
+SNAKE_WINDOW_PX = 56
+SNAKE_MAX_STEPS = 24
+SNAKE_MIN_PIXELS = 40
+# RescueLine 3.6.6: markers sit JUST BEFORE the intersection, so only markers
+# within this arc length (measured along the traced line, from the robot end)
+# are the robot's own. Beyond it the marker belongs to a robot approaching the
+# same intersection from another branch -- turning on that one means obeying
+# someone else's instruction. Sized against the near ROI's ~91px depth plus
+# the marker-to-intersection gap: a marker one ROI-depth ahead is still mine,
+# one on the far side of the intersection is not.
+SNAKE_MARKER_MAX_AHEAD_PX = 110
+
+# --- Follow-the-gap depth avoidance (see depth_nav.py) ----------------------
+# Steers around the obstacle on live depth while it is still 300-500mm out,
+# instead of waiting for it to enter the blind zone and then dead-reckoning.
+GAP_NAV_ENABLED = True
+# Columns masked either side of the closest return before choosing a gap --
+# the "safety bubble". Must cover the robot's half-width at the obstacle's
+# range: ~100mm at 350mm subtends roughly 70px at this FOV.
+GAP_BUBBLE_COLS = 70
+# A gap narrower than the robot is not a gap. 200mm robot at ~350mm range.
+GAP_MIN_WIDTH_COLS = 140
+# Rows in a column that must read nearer-than-floor before it counts as
+# occupied. Rejects single-row depth noise.
+GAP_COLUMN_MIN_HITS = 6
+# Above this fraction of invalid depth a column is unmeasurable, not clear.
+# This is the near-obstacle case: too close to return depth at all.
+GAP_UNKNOWN_MAX_FRAC = 0.85
+# Steering authority for the gap controller, and the range at which it starts
+# blending in over the line follower.
+GAP_STEER_GAIN = 0.55
+GAP_ENGAGE_RANGE_MM = 450.0
+# Below this the obstacle fills the view; commit to the timed box instead.
+GAP_COMMIT_RANGE_MM = 200.0
 
 # Camera
 CAMERA_WIDTH = 640
@@ -268,7 +331,6 @@ MOTOR_COMMAND_TIMEOUT_S = 0.3
 
 # Indicator pins. Moved off BCM 5/6/13: 13 collided with LEFT_LPWM, and 5/6 sit
 # in the pull-UP bank so an LED would glow through boot.
-STATUS_LED_PIN = 26
 RED_LED_PIN = 22
 GREEN_LED_PIN = 23
 BUZZER_PIN = 24
@@ -350,12 +412,6 @@ GROUND_DEPTH_TOLERANCE_MM = 40.0 # Anything closer by this amount is an obstacle
 # line and flapping a hard +/-0.6 steering offset at frame rate. Re-enabling needs
 # a higher camera mount, not a bigger tolerance.
 OBSTACLE_DETECTION_ENABLED = False
-# Competition obstacles are >=15cm high (RescueLine rules 3.5.4) and have NO
-# specified colour -- red marks the goal tile and the dead-victim point instead,
-# so colour must not be used as the obstacle cue. A 150mm object is ~2.5x the
-# camera height: a large depth step, well outside the near-field blind zone.
-OBSTACLE_MIN_HEIGHT_MM = 100.0
-OBSTACLE_MIN_AREA_PX = 400
 
 # --- Obstacle band detection + go-around ----------------------------------
 # Separate from the per-pixel mask above, which stays off. Because the lens sits
@@ -370,7 +426,14 @@ OBSTACLE_MIN_AREA_PX = 400
 # plus a per-column Python scan in detect_obstacle_band. That is pure loop latency
 # in the steering path for a feature that cannot trigger. Re-enable together with
 # OBSTACLE_TRIGGER_ON_DROPOUT once the line following is solid again.
-OBSTACLE_BAND_ENABLED = False
+OBSTACLE_BAND_ENABLED = True
+
+# Rows below this fraction of the frame image near floor inside the D435i
+# blind zone, where USB-2 depth reads garbage non-zero values that beat the
+# expected-floor map and paint phantom bands. An upright obstacle is anchored
+# at the TOP of the frame (see below), so ignoring the bottom costs nothing.
+# This replaces the hand-edit found live on the Pi that zeroed the same rows.
+OBSTACLE_BAND_IGNORE_BELOW_FRAC = 0.40
 
 # A downward ray reaches the floor before an obstacle whenever the floor is
 # nearer, so an obstacle does NOT fill its columns -- it is anchored at the top
@@ -391,30 +454,26 @@ OBSTACLE_BAND_MIN_FRAMES = 3
 # once a tracked band's depth vanishes we are at the near limit. Distance is
 # therefore imprecise and preset-dependent -- a deliberate trade for not needing
 # to dead-reckon through the blind zone.
-OBSTACLE_TRIGGER_ON_DROPOUT = False
+OBSTACLE_TRIGGER_ON_DROPOUT = True
 # A band must have been this close before its dropout is trusted, so a band
 # lost to noise at long range does not fire the manoeuvre.
 OBSTACLE_DROPOUT_MAX_RANGE_MM = 320.0
 # Consecutive all-invalid frames required. Depth flickers; one frame is noise.
 OBSTACLE_DROPOUT_FRAMES = 2
 
-ROBOT_WIDTH_MM = 200.0
-# Obstacles occupy at most one tile (300mm). Clearing a worst-case one needs
-# obstacle half-width + robot half-width + margin. This exceeds the 150mm of
-# on-tile room either side of the line, so the robot briefly leaves the tile --
-# the rules score navigating AROUND an obstacle, not staying on-tile.
-OBSTACLE_CLEARANCE_MARGIN_MM = 40.0
-OBSTACLE_LATERAL_OFFSET_MM = 150.0 + ROBOT_WIDTH_MM / 2.0 + OBSTACLE_CLEARANCE_MARGIN_MM
-# Forward run past the obstacle before cutting back toward the line. One tile
-# plus the robot's own length worth of slack.
-OBSTACLE_PASS_FORWARD_MM = 380.0
 # Speeds for the manoeuvre. Deliberately below BASE_SPEED: the legs are
-# dead-reckoned, and odometry error grows with speed.
+# open-loop, and error grows with speed.
 OBSTACLE_MANEUVER_SPEED = 0.20
-OBSTACLE_MANEUVER_TURN = 0.55
-# Give up on a leg after this long even if the odometry target is never met,
-# so a stalled wheel or bad flow estimate cannot hang the manoeuvre forever.
-OBSTACLE_LEG_TIMEOUT_S = 6.0
-# After the pass, sweep this far looking for the line before declaring failure
-# and retrying on the other side.
-OBSTACLE_REACQUIRE_MM = 260.0
+OBSTACLE_MANEUVER_TURN = 0.65
+# Timed "box" legs. There are no encoders and odometry is off (IMU disabled on
+# the USB-2 link), so the mm-based legs of the arc go-around had NOTHING to
+# measure against: obstacle_leg_done fell through to its 6s timeout on every
+# leg, producing a 6-second blind arc. A skid-steer pivots in place cleanly,
+# so the manoeuvre is a timed box instead: pivot 90, clear, pivot back,
+# pass, pivot toward the line, cross, re-align. Durations carried over from
+# the values hand-tuned live on the Pi on 2026-07-31.
+OBSTACLE_PIVOT_90_S = 0.8
+OBSTACLE_CLEAR_S = 1.2
+OBSTACLE_PASS_S = 2.5
+# Give up on the return crossing after this long and fall back to searching.
+OBSTACLE_RETURN_TIMEOUT_S = 3.0
