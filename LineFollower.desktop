@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Line Follower
+Comment=Start the TemuFollower line follower
+# Terminal=true so the state machine's output is visible and Ctrl-C works --
+# a silent background launch gives no way to see what the robot is doing or
+# to stop it.
+Terminal=true
+Exec=/home/dpsi-lfr/Desktop/Anti-Inertia/TemuFollower/run.sh
+Path=/home/dpsi-lfr/Desktop/Anti-Inertia/TemuFollower
+Icon=applications-robotics
+Categories=Utility;

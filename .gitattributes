@@ -1,0 +1,6 @@
+# Shell scripts and .desktop files run on the Pi (Linux) but are edited on
+# Windows, where git's autocrlf would rewrite them to CRLF on checkout. A
+# CRLF shebang makes the kernel look for an interpreter literally named
+# "bash\r", which fails as "bad interpreter: No such file or directory".
+*.sh text eol=lf
+*.desktop text eol=lf
